@@ -1,0 +1,419 @@
+"""
+watcher.py — TraderBot v2
+Reads trader_objects_SYMBOL.txt (written by ObjectExporter EA).
+Detects candle touches on trader-drawn lines, delegates to SourceState.
+"""
+import MetaTrader5 as mt5
+import threading
+import time as _time
+import os as _os
+import sys
+import logging
+from dataclasses import dataclass
+from typing import Optional
+from datetime import datetime
+
+sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+
+import config as cfg
+from core.order_manager import get_pip_size
+from core.position_monitor import SourceState
+
+log = logging.getLogger("watcher_v2")
+
+
+# ── File-bridge helpers (same as v1) ──────────────────────────────
+
+def _get_file_paths(symbol=None):
+    appdata  = _os.environ.get("APPDATA", "")
+    paths    = []
+    fname_sym = f"trader_objects_{symbol}.txt" if symbol else None
+    fname_gen = "trader_objects.txt"
+
+    common = _os.path.join(appdata, "MetaQuotes", "Terminal", "Common", "Files")
+    if fname_sym: paths.append(_os.path.join(common, fname_sym))
+    paths.append(_os.path.join(common, fname_gen))
+
+    terminal_root = _os.path.join(appdata, "MetaQuotes", "Terminal")
+    try:
+        if _os.path.isdir(terminal_root):
+            for tid in _os.listdir(terminal_root):
+                t_path = _os.path.join(terminal_root, tid, "MQL5", "Files")
+                if _os.path.isdir(t_path):
+                    if fname_sym: paths.append(_os.path.join(t_path, fname_sym))
+                    paths.append(_os.path.join(t_path, fname_gen))
+    except Exception:
+        pass
+
+    roaming = _os.path.join(_os.environ.get("USERPROFILE",""),
+                            "AppData","Roaming","MetaQuotes","Terminal")
+    try:
+        if _os.path.isdir(roaming):
+            for tid in _os.listdir(roaming):
+                t_path = _os.path.join(roaming, tid, "MQL5", "Files")
+                if _os.path.isdir(t_path):
+                    if fname_sym: paths.append(_os.path.join(t_path, fname_sym))
+                    paths.append(_os.path.join(t_path, fname_gen))
+    except Exception:
+        pass
+
+    return paths
+
+
+def _find_objects_file(symbol=None):
+    syms = [symbol]
+    if symbol:
+        syms.append(symbol[:-2] if symbol.endswith("_i") else symbol + "_i")
+        syms.append(None)
+    best_path, best_age = None, float("inf")
+    for sym in syms:
+        for p in _get_file_paths(sym):
+            if _os.path.exists(p):
+                try:
+                    age = _time.time() - _os.path.getmtime(p)
+                    if age < best_age:
+                        best_age  = age
+                        best_path = p
+                except Exception:
+                    if best_path is None:
+                        best_path = p
+    return best_path
+
+
+@dataclass
+class ChartObject:
+    name:     str
+    obj_type: str
+    type_id:  int
+    price1:   float
+    price2:   float
+
+    @property
+    def is_hline(self):
+        return self.obj_type == "HLINE"
+
+    @property
+    def is_rectangle(self):
+        return self.obj_type in ("RECTANGLE",) or self.type_id in (16, 20)
+
+    @property
+    def rect_valid(self):
+        return abs(self.price1 - self.price2) > 1e-8
+
+    @property
+    def rect_top(self):
+        return max(self.price1, self.price2)
+
+    @property
+    def rect_bottom(self):
+        return min(self.price1, self.price2)
+
+
+def _parse_file(path: str):
+    """Returns (objects, candle_dict, file_symbol)"""
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+    except Exception as e:
+        log.warning("Could not read %s: %s", path, e)
+        return [], {}, None
+
+    candle, file_symbol, objects = {}, None, []
+
+    for line in lines:
+        line = line.strip()
+        if line.startswith("SYMBOL:"):
+            file_symbol = line.split(":", 1)[1].strip()
+        elif line.startswith(("CANDLE_", "PREV_", "BID:")):
+            k, _, v = line.partition(":")
+            try:
+                candle[k] = float(v) if "." in v else int(v)
+            except ValueError:
+                pass
+        elif line.startswith("OBJ"):
+            parts = line.split("|")
+            data  = {}
+            for p in parts[1:]:
+                if ":" in p:
+                    k, v = p.split(":", 1)
+                    data[k] = v
+            try:
+                name = data.get("NAME", "?")
+                if any(name.startswith(pfx) for pfx in cfg.AUTO_OBJECT_PREFIXES):
+                    continue
+                objects.append(ChartObject(
+                    name     = name,
+                    obj_type = data.get("TYPE", "OTHER"),
+                    type_id  = int(data.get("TYPEID", 0)),
+                    price1   = float(data.get("PRICE1", 0)),
+                    price2   = float(data.get("PRICE2", 0)),
+                ))
+            except Exception:
+                pass
+
+    return objects, candle, file_symbol
+
+
+# ── Signals ───────────────────────────────────────────────────────
+
+class WatcherSignals:
+    def __init__(self):
+        self._log_cbs    = []
+        self._status_cbs = []
+        self._state_cbs  = []
+        self._candle_cbs = []
+
+    def on_log(self, fn):    self._log_cbs.append(fn)
+    def on_status(self, fn): self._status_cbs.append(fn)
+    def on_state(self, fn):  self._state_cbs.append(fn)
+    def on_candle(self, fn): self._candle_cbs.append(fn)
+
+    def emit_log(self, msg, level="INFO"):
+        for fn in self._log_cbs: fn(msg, level)
+
+    def emit_status(self, msg):
+        for fn in self._status_cbs: fn(msg)
+
+    def emit_state(self, states):
+        for fn in self._state_cbs: fn(states)
+
+    def emit_candle(self, candle):
+        for fn in self._candle_cbs: fn(candle)
+
+
+# ── Watcher Thread ────────────────────────────────────────────────
+
+class WatcherThread(threading.Thread):
+
+    def __init__(self, symbol: str, lot_size: float, follow_enabled: bool = True):
+        super().__init__(daemon=True)
+        self.symbol         = symbol
+        self.lot_size       = lot_size
+        self.follow_enabled = follow_enabled
+        self.sig            = WatcherSignals()
+        self._stop_event    = threading.Event()
+        self._sources: dict[str, SourceState] = {}
+        self._seen:    set = set()
+        self._skipped: set = set()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def log(self, msg: str, level: str = "INFO"):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.sig.emit_log(f"{ts}  {msg}", level)
+        getattr(log, "warning" if level == "WARN" else
+                     level.lower() if level.lower() in ("info","error","debug") else "info")(msg)
+
+    def run(self):
+        self.log("=" * 60)
+        self.log("  TraderBot v2 — 2-Order Martingale Bot")
+        self.log("=" * 60)
+
+        if not self._connect():
+            return
+
+        pip = get_pip_size(self.symbol)
+        self.log(f"Symbol: {self.symbol}  pip={pip:.5f}  "
+                 f"order_dist={cfg.ORDER_DISTANCE_PIPS}pips={cfg.ORDER_DISTANCE_PIPS*pip:.5f}")
+        self.log("⏳  Waiting for ObjectExporter EA file…")
+        self.sig.emit_status("⏳  Waiting for EA…")
+
+        warned_missing = stale_warned = False
+        last_ea_warn   = None
+
+        while not self._stop_event.is_set():
+            try:
+                # Read dist_pips fresh every cycle from config
+                # (so GUI changes take effect immediately)
+                dist_pips = cfg.ORDER_DISTANCE_PIPS
+
+                path = _find_objects_file(self.symbol)
+
+                if path is None:
+                    if not warned_missing:
+                        self.log("⚠️  trader_objects.txt not found — is ObjectExporter EA running?", "WARN")
+                        warned_missing = True
+                    self.sig.emit_status("⏳  Waiting for EA…")
+                    self._stop_event.wait(cfg.SCAN_INTERVAL_SEC)
+                    continue
+
+                warned_missing = False
+
+                try:
+                    file_age = _time.time() - _os.path.getmtime(path)
+                except Exception:
+                    file_age = 0
+
+                if file_age > 15:
+                    if not stale_warned:
+                        self.log(f"⚠️  EA file {file_age:.0f}s old — EA not running?", "WARN")
+                        stale_warned = True
+                    self.sig.emit_status(f"⚠️  EA stopped ({file_age:.0f}s)")
+                    self._stop_event.wait(cfg.SCAN_INTERVAL_SEC)
+                    continue
+                else:
+                    if stale_warned:
+                        self.log("✅  EA writing again — resuming")
+                    stale_warned = False
+
+                objects, candle, ea_sym = _parse_file(path)
+
+                if ea_sym and ea_sym != self.symbol:
+                    if ea_sym != last_ea_warn:
+                        last_ea_warn = ea_sym
+                        self.log(f"⚠️  EA on '{ea_sym}' — bot watching '{self.symbol}'", "WARN")
+                    self.sig.emit_status(f"⚠️  EA on wrong chart ({ea_sym})")
+                    self._stop_event.wait(cfg.SCAN_INTERVAL_SEC)
+                    continue
+
+                last_ea_warn = None
+                self.sig.emit_candle(candle)
+
+                cur_t  = candle.get("CANDLE_T", 0)
+                cur_h  = candle.get("CANDLE_H", 0.0)
+                cur_l  = candle.get("CANDLE_L", 0.0)
+                cur_c  = candle.get("CANDLE_C", 0.0)
+                prev_h = candle.get("PREV_H", 0.0)
+                prev_l = candle.get("PREV_L", 0.0)
+                prev_c = candle.get("PREV_C", 0.0)
+                prev_t = candle.get("PREV_T", 0)
+                bid    = candle.get("BID", 0.0)
+
+                tick          = mt5.symbol_info_tick(self.symbol)
+                current_price = (tick.bid + tick.ask) / 2 if tick else bid or cur_c
+
+                cur_names = {o.name for o in objects}
+
+                # ── New lines ─────────────────────────────────────
+                for o in objects:
+                    n = o.name
+                    if n in self._seen or n in self._skipped:
+                        continue
+
+                    if current_price > 0 and o.price1 > 0:
+                        ratio = o.price1 / current_price
+                        if ratio < 0.5 or ratio > 2.0:
+                            self._skipped.add(n)
+                            continue
+
+                    src = None
+                    if o.is_hline:
+                        src = o.price1
+                    elif o.is_rectangle and o.rect_valid:
+                        src = round((o.rect_top + o.rect_bottom) / 2, 5)
+
+                    if src is not None:
+                        state = SourceState(
+                            name      = n,
+                            price     = src,
+                            pip_size  = pip,
+                            symbol    = self.symbol,
+                            base_lot  = self.lot_size,
+                            dist_pips = dist_pips,   # ← pass current GUI value
+                            log_fn    = self.log,
+                        )
+                        state.registered_at = cur_t
+                        state.last_prev_t   = prev_t
+                        self._sources[n] = state
+                        self._seen.add(n)
+                        self.log(
+                            f"🆕  [{n[:25]}] @ {src:.5f} registered | "
+                            f"dist={dist_pips}pips | waiting for candle touch"
+                        )
+
+                # ── Removed lines ─────────────────────────────────
+                for n in list(self._sources.keys()):
+                    if n not in cur_names:
+                        self.log(f"🗑️  [{n[:25]}] removed — cancelling orders")
+                        self._sources[n].reset()
+                        del self._sources[n]
+                        self._seen.discard(n)
+
+                # ── Moved lines ───────────────────────────────────
+                if self.follow_enabled:
+                    for o in objects:
+                        n = o.name
+                        if n not in self._sources:
+                            continue
+                        state = self._sources[n]
+                        new_price = None
+                        if o.is_hline:
+                            new_price = o.price1
+                        elif o.is_rectangle and o.rect_valid:
+                            new_price = round((o.rect_top + o.rect_bottom) / 2, 5)
+                        if new_price and abs(new_price - state.price) > 1e-6:
+                            self.log(f"↕️  [{n[:25]}] moved {state.price:.5f}→{new_price:.5f} — resetting")
+                            state.reset()
+                            state.price         = new_price
+                            state.dist_pips     = dist_pips   # update dist on move too
+                            state.registered_at = cur_t
+                            state.last_prev_t   = prev_t
+
+                # ── Touch detection ───────────────────────────────
+                for n, state in self._sources.items():
+                    if state.state != SourceState.IDLE:
+                        continue
+
+                    src = state.price
+                    reg = state.registered_at
+                    touched, desc = False, ""
+
+                    if cur_h > 0 and cur_t != reg:
+                        if cur_l <= src <= cur_h:
+                            touched = True
+                            desc    = f"current candle C={cur_c:.5f}"
+
+                    if not touched and prev_h > 0:
+                        if prev_t > state.last_prev_t and prev_t > reg:
+                            state.last_prev_t = prev_t
+                            if prev_l <= src <= prev_h:
+                                touched = True
+                                desc    = f"prev candle C={prev_c:.5f}"
+
+                    if touched:
+                        self.log(
+                            f"🎯  [{n[:20]}] touched @ {src:.5f} ({desc}) | "
+                            f"dist={state.dist_pips}pips | placing orders", "NEW"
+                        )
+                        state.place_initial_pair()
+
+                # ── Monitor active/pending states ─────────────────
+                for n, state in self._sources.items():
+                    if state.state in (SourceState.PENDING, SourceState.ACTIVE):
+                        state.check(candle)
+
+                # ── Emit state to GUI ─────────────────────────────
+                self.sig.emit_state([s.summary for s in self._sources.values()])
+
+                idle = [n for n, s in self._sources.items() if s.state == SourceState.IDLE]
+                if idle:
+                    self.sig.emit_status(f"🟢  Watching {len(idle)} line(s) | bid={bid:.5f}")
+                elif self._sources:
+                    self.sig.emit_status(f"🟢  {len(self._sources)} sequence(s) active")
+                else:
+                    self.sig.emit_status("🟢  Running — draw a line to start")
+
+            except Exception as e:
+                import traceback as _tb
+                self.log(f"💥 Watcher error: {type(e).__name__}: {e}", "ERROR")
+                for line in _tb.format_exc().strip().splitlines():
+                    self.log(f"   {line}", "ERROR")
+
+            self._stop_event.wait(cfg.SCAN_INTERVAL_SEC)
+
+        mt5.shutdown()
+        self.sig.emit_status("⚫  Stopped")
+        self.log("Bot stopped.")
+
+    def _connect(self) -> bool:
+        if not mt5.initialize(login=cfg.MT5_LOGIN,
+                              password=cfg.MT5_PASSWORD,
+                              server=cfg.MT5_SERVER):
+            self.log(f"❌ MT5 connection failed: {mt5.last_error()}", "ERROR")
+            self.sig.emit_status("❌  MT5 connection failed")
+            return False
+        info = mt5.account_info()
+        self.log(f"✅ Connected: {info.name} | Balance: {info.balance:.2f} {info.currency}")
+        self.sig.emit_status(f"🟢  Connected — {info.name}")
+        return True

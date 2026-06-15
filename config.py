@@ -24,17 +24,17 @@ ORDER_DISTANCE_PIPS = 1.5      # pips above line for BUY-STOP, below for SELL-ST
 # e.g. BUY-STOP entry = line + distance → SL = line - distance
 # SL is always the mirror of entry across the source line
 
-LOT_SIZE        = 0.01          # initial lot size (round 1)
-LOT_MULTIPLIER  = 1.20          # multiply lot by this after each SL hit (20% increase)
-MAX_ROUNDS      = 9             # maximum martingale rounds
+LOT_SIZE        = 0.01          # initial lot size
+LOT_MULTIPLIER  = 1.20          # kept for reference, not used in hedge mode
 
-TP_RR_RATIO     = 2.0           # TP = SL distance × this ratio  (set 0 to disable TP)
+TP_RR_RATIO     = 0.0           # no fixed pip TP — balance TP used instead
 MAGIC_NUMBER    = 998877        # unique ID so bot can identify its own orders
 
 # ── OBJECT FILTERING ─────────────────────────────────────────────
 # Prefixes of auto-drawn or indicator objects to ignore
 AUTO_OBJECT_PREFIXES = [
     "PA_", "CT", "GB_", "TB2_", "autotrade",
+    "FVG_",   # FVG detector rectangles — never treat as trade signals
 ]
 
 BOT_LINE_PREFIX = "TB2_"        # prefix for bot-drawn lines

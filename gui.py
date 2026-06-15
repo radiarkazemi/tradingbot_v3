@@ -29,12 +29,11 @@ os.makedirs("logs", exist_ok=True)
 from config import (
     MT5_LOGIN, MT5_PASSWORD, MT5_SERVER,
     WATCH_SYMBOL, SCAN_INTERVAL_SEC,
-    LOT_SIZE, LOT_MULTIPLIER, MAX_ROUNDS,
-    ORDER_DISTANCE_PIPS, TP_RR_RATIO, MAGIC_NUMBER,
+    LOT_SIZE, ORDER_DISTANCE_PIPS, MAGIC_NUMBER,
 )
 from core.watcher import WatcherThread
 from core.position_monitor import SourceState
-from core.order_manager import lot_for_round
+from core.fvg_watcher import FVGWatcher
 
 # ── Palette (matches v1 exactly) ─────────────────────────────────
 C = {
@@ -118,8 +117,6 @@ class Sig(QObject):
     status   = pyqtSignal(str)
     state    = pyqtSignal(list)
     candle   = pyqtSignal(dict)
-
-
 # ── Helpers ───────────────────────────────────────────────────────
 def _vline():
     f = QFrame(); f.setFrameShape(QFrame.VLine)
@@ -128,8 +125,6 @@ def _vline():
 def _hline():
     f = QFrame(); f.setFrameShape(QFrame.HLine)
     f.setStyleSheet(f"color:{C['border']};"); return f
-
-
 # ── Main Window ───────────────────────────────────────────────────
 class GUI(QMainWindow):
 
@@ -140,6 +135,7 @@ class GUI(QMainWindow):
         self.setStyleSheet(SS)
 
         self._worker: Optional[WatcherThread] = None
+        self._fvg_worker: Optional[FVGWatcher] = None
         self._sig = Sig()
         self._sig.log_line.connect(self._on_log)
         self._sig.status.connect(self._on_status)
@@ -257,37 +253,16 @@ class GUI(QMainWindow):
         self.spin_lot = QDoubleSpinBox()
         self.spin_lot.setRange(0.01, 100.0); self.spin_lot.setSingleStep(0.01)
         self.spin_lot.setValue(LOT_SIZE); self.spin_lot.setDecimals(2)
-        self.spin_lot.valueChanged.connect(self._update_lot_preview)
+        
         _row("📦 Base Lot:", self.spin_lot, cl, "Starting lot size (round 1)")
 
-        # Lot multiplier
-        self.spin_mult = QDoubleSpinBox()
-        self.spin_mult.setRange(1.01, 3.00); self.spin_mult.setSingleStep(0.05)
-        self.spin_mult.setValue(LOT_MULTIPLIER); self.spin_mult.setDecimals(2)
-        self.spin_mult.valueChanged.connect(self._update_lot_preview)
-        _row("✖️ Multiplier:", self.spin_mult, cl, "Lot × this after each SL hit (1.20 = +20%)")
-
-        # Max rounds
-        self.spin_rounds = QSpinBox()
-        self.spin_rounds.setRange(1, 20); self.spin_rounds.setValue(MAX_ROUNDS)
-        self.spin_rounds.valueChanged.connect(self._update_lot_preview)
-        _row("🔁 Max Rounds:", self.spin_rounds, cl, "Maximum martingale iterations (default 9)")
-
-        # TP (R:R)
-        tp_row = QHBoxLayout(); tp_row.setSpacing(6)
-        lbl_tp = _lbl("🎯 TP (R:R):"); lbl_tp.setFixedWidth(100)
-        tp_row.addWidget(lbl_tp)
-        self.chk_tp = QCheckBox()
-        self.chk_tp.setChecked(TP_RR_RATIO > 0)
-        self.chk_tp.setToolTip("Enable Take Profit (unchecked = no TP)")
-        tp_row.addWidget(self.chk_tp)
-        self.spin_tp = QDoubleSpinBox()
-        self.spin_tp.setRange(0.1, 20.0); self.spin_tp.setSingleStep(0.5)
-        self.spin_tp.setValue(max(TP_RR_RATIO, 2.0)); self.spin_tp.setDecimals(1)
-        self.spin_tp.setEnabled(self.chk_tp.isChecked())
-        self.chk_tp.toggled.connect(self.spin_tp.setEnabled)
-        tp_row.addWidget(self.spin_tp)
-        cl.addLayout(tp_row)
+        # Balance TP %
+        self.spin_balance_tp = QDoubleSpinBox()
+        self.spin_balance_tp.setRange(1.0, 100.0); self.spin_balance_tp.setSingleStep(1.0)
+        self.spin_balance_tp.setValue(10.0); self.spin_balance_tp.setDecimals(1)
+        self.spin_balance_tp.setSuffix(" %")
+        _row("💰 Balance TP:", self.spin_balance_tp, cl,
+             "Close all & stop when balance grows by this % from start")
 
         # Follow moved lines
         self.chk_follow = QCheckBox("Follow moved lines")
@@ -295,6 +270,16 @@ class GUI(QMainWindow):
         self.chk_follow.setToolTip(
             "When you drag a line on the chart, the bot resets and re-watches from the new position")
         cl.addWidget(self.chk_follow)
+
+        # Resume previous session
+        self.chk_resume = QCheckBox("Resume previous session")
+        self.chk_resume.setChecked(False)
+        self.chk_resume.setToolTip(
+            "On start, scan MT5 for existing bot positions/orders\n"
+            "and resume monitoring them without re-entering.\n"
+            "Use this if the bot stopped unexpectedly.")
+        self.chk_resume.setStyleSheet(f"color:{C['orange']};")
+        cl.addWidget(self.chk_resume)
 
         cl.addWidget(_hline())
 
@@ -314,17 +299,6 @@ class GUI(QMainWindow):
 
         vl.addWidget(grp_ctrl)
 
-        # ── Lot Schedule group ────────────────────────────────────
-        grp_lots = QGroupBox("📊  Lot Schedule")
-        ll = QVBoxLayout(grp_lots); ll.setSpacing(4)
-        self.lbl_lots = QLabel()
-        self.lbl_lots.setStyleSheet(
-            f"color:{C['txt2']};font-family:Consolas;font-size:10px;")
-        self.lbl_lots.setWordWrap(True)
-        ll.addWidget(self.lbl_lots)
-        vl.addWidget(grp_lots)
-        self._update_lot_preview()
-
         # ── Active Sequences group ────────────────────────────────
         grp_seq = QGroupBox("🔥  Active Sequences")
         sl = QVBoxLayout(grp_seq); sl.setSpacing(2)
@@ -334,6 +308,84 @@ class GUI(QMainWindow):
         self.lbl_sequences.setWordWrap(True)
         sl.addWidget(self.lbl_sequences)
         vl.addWidget(grp_seq)
+
+        # ── Balance TP progress ───────────────────────────────────
+        grp_bal = QGroupBox("💰  Balance Progress")
+        bl = QVBoxLayout(grp_bal); bl.setSpacing(4)
+        self.lbl_balance = QLabel("Balance: —")
+        self.lbl_balance.setStyleSheet(f"color:{C['gold']};font-family:Consolas;font-size:11px;")
+        bl.addWidget(self.lbl_balance)
+        self.lbl_balance_target = QLabel("Target: —")
+        self.lbl_balance_target.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
+        bl.addWidget(self.lbl_balance_target)
+        vl.addWidget(grp_bal)
+
+        # ── FVG Settings group ────────────────────────────────────
+        grp_fvg = QGroupBox("📐  Fair Value Gaps (FVG)")
+        fv = QVBoxLayout(grp_fvg); fv.setSpacing(6)
+
+        # Enable toggle
+        self.chk_fvg = QCheckBox("Enable FVG detection")
+        self.chk_fvg.setChecked(True)
+        self.chk_fvg.setToolTip("Scan candles for FVG patterns and draw rectangles on chart")
+        fv.addWidget(self.chk_fvg)
+
+        # Min gap pips (quality filter)
+        fvg_gap_row = QHBoxLayout(); fvg_gap_row.setSpacing(8)
+        lbl_gap = _lbl("📏 Min Gap (pips):")
+        lbl_gap.setFixedWidth(100)
+        lbl_gap.setToolTip(
+            "Minimum FVG size in pips.\n"
+            "↑ Increase → fewer FVGs, higher quality\n"
+            "↓ Decrease → more FVGs, more noise\n"
+            "Recommended: 2-5 for M1, 5-15 for M15"
+        )
+        fvg_gap_row.addWidget(lbl_gap)
+        self.spin_fvg_gap = QDoubleSpinBox()
+        self.spin_fvg_gap.setRange(0.5, 200.0)
+        self.spin_fvg_gap.setSingleStep(0.5)
+        self.spin_fvg_gap.setValue(3.0)
+        self.spin_fvg_gap.setDecimals(1)
+        self.spin_fvg_gap.setSuffix(" pips")
+        self.spin_fvg_gap.valueChanged.connect(self._on_fvg_settings_changed)
+        fvg_gap_row.addWidget(self.spin_fvg_gap)
+        fv.addLayout(fvg_gap_row)
+
+        # Lookback candles
+        fvg_lb_row = QHBoxLayout(); fvg_lb_row.setSpacing(8)
+        lbl_lb = _lbl("🕯 Lookback:")
+        lbl_lb.setFixedWidth(100)
+        lbl_lb.setToolTip("How many candles to scan for FVGs")
+        fvg_lb_row.addWidget(lbl_lb)
+        self.spin_fvg_lookback = QSpinBox()
+        self.spin_fvg_lookback.setRange(10, 1000)
+        self.spin_fvg_lookback.setSingleStep(50)
+        self.spin_fvg_lookback.setValue(200)
+        self.spin_fvg_lookback.valueChanged.connect(self._on_fvg_settings_changed)
+        fvg_lb_row.addWidget(self.spin_fvg_lookback)
+        fv.addLayout(fvg_lb_row)
+
+        # Max rectangles to draw
+        fvg_max_row = QHBoxLayout(); fvg_max_row.setSpacing(8)
+        lbl_max = _lbl("🔲 Max Rects:")
+        lbl_max.setFixedWidth(100)
+        lbl_max.setToolTip("Maximum FVG rectangles drawn on chart (newest first)")
+        fvg_max_row.addWidget(lbl_max)
+        self.spin_fvg_max = QSpinBox()
+        self.spin_fvg_max.setRange(1, 200)
+        self.spin_fvg_max.setSingleStep(5)
+        self.spin_fvg_max.setValue(30)
+        self.spin_fvg_max.valueChanged.connect(self._on_fvg_settings_changed)
+        fvg_max_row.addWidget(self.spin_fvg_max)
+        fv.addLayout(fvg_max_row)
+
+        # FVG count label
+        self.lbl_fvg_count = QLabel("FVGs: —")
+        self.lbl_fvg_count.setStyleSheet(
+            f"color:{C['cyan']};font-family:Consolas;font-size:10px;")
+        fv.addWidget(self.lbl_fvg_count)
+
+        vl.addWidget(grp_fvg)
 
         # ── Cancel All group ──────────────────────────────────────
         grp_cancel = QGroupBox("🛑  Emergency")
@@ -406,7 +458,7 @@ class GUI(QMainWindow):
         # Sources table
         self.src_table = QTableWidget(0, 6)
         self.src_table.setHorizontalHeaderLabels(
-            ["Line Name", "Price", "State", "Round", "Direction", "Next Lot"])
+            ["Line Name", "Price", "State", "Round", "BUY Lot", "SELL Lot"])
         self.src_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         for i in range(1, 6):
             self.src_table.horizontalHeader().setSectionResizeMode(
@@ -448,9 +500,9 @@ class GUI(QMainWindow):
         # Pending orders table
         grp_pend = QGroupBox("🔵  Pending Orders")
         pv = QVBoxLayout(grp_pend); pv.setContentsMargins(4, 4, 4, 4)
-        self.tbl_pending = QTableWidget(0, 5)
+        self.tbl_pending = QTableWidget(0, 6)
         self.tbl_pending.setHorizontalHeaderLabels(
-            ["Ticket", "Type", "Entry", "SL", "TP"])
+            ["Ticket", "Type", "Entry", "SL", "Volume", "TP"])
         self.tbl_pending.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tbl_pending.setAlternatingRowColors(True)
         self.tbl_pending.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -501,17 +553,20 @@ class GUI(QMainWindow):
         lot    = self.spin_lot.value()
         follow = self.chk_follow.isChecked()
 
-        # Push runtime config overrides
         import config as cfg
-        cfg.ORDER_DISTANCE_PIPS = self.spin_dist.value()
-        cfg.LOT_SIZE            = lot
-        cfg.LOT_MULTIPLIER      = self.spin_mult.value()
-        cfg.MAX_ROUNDS          = self.spin_rounds.value()
-        cfg.TP_RR_RATIO         = self.spin_tp.value() if self.chk_tp.isChecked() else 0.0
+        cfg.ORDER_DISTANCE_PIPS  = self.spin_dist.value()
+        cfg.LOT_SIZE             = lot
+        cfg.TP_RR_RATIO          = 0.0
+        cfg.BALANCE_TP_RATIO     = 1.0 + self.spin_balance_tp.value() / 100.0
 
         self.lbl_sym_hdr.setText(sym)
 
-        self._worker = WatcherThread(symbol=sym, lot_size=lot, follow_enabled=follow)
+        self._worker = WatcherThread(
+            symbol         = sym,
+            lot_size       = lot,
+            follow_enabled = follow,
+            resume_enabled = self.chk_resume.isChecked(),
+        )
         self._worker.sig.on_log(    lambda m, l: self._sig.log_line.emit(m, l))
         self._worker.sig.on_status( lambda s:    self._sig.status.emit(s))
         self._worker.sig.on_state(  lambda s:    self._sig.state.emit(s))
@@ -522,7 +577,22 @@ class GUI(QMainWindow):
         self.btn_stop.setEnabled(True)
         self._on_status("🟡  Starting…")
 
+        # Start FVG watcher if enabled
+        if self.chk_fvg.isChecked():
+            self._fvg_worker = FVGWatcher(
+                symbol       = sym,
+                min_gap_pips = self.spin_fvg_gap.value(),
+                lookback     = self.spin_fvg_lookback.value(),
+                max_draw     = self.spin_fvg_max.value(),
+                scan_interval= 5.0,
+                log_fn       = lambda m, l="INFO": self._sig.log_line.emit(m, l),
+            )
+            self._fvg_worker.start()
+
     def _stop(self):
+        if self._fvg_worker:
+            self._fvg_worker.stop()
+            self._fvg_worker = None
         if self._worker:
             self._worker.stop()
             self._worker = None
@@ -573,12 +643,12 @@ class GUI(QMainWindow):
         self.src_table.setRowCount(len(states))
         active_lines = []
         for r, s in enumerate(states):
-            st    = s["state"]
-            dir_  = s.get("direction") or "—"
-            rnd   = s["round"]
-            next_lot = lot_for_round(rnd + 1 if rnd > 0 else 1,
-                                     self.spin_lot.value()) if st in (
-                SourceState.PENDING, SourceState.ACTIVE) else self.spin_lot.value()
+            st  = s["state"]
+            rnd = s["round"]
+            # direction field is now "B:0.02 S:0.04"
+            dir_str  = s.get("direction") or "—"
+            buy_lot  = s.get("buy_lot",  s.get("lot", 0.0))
+            sell_lot = s.get("sell_lot", s.get("lot", 0.0))
 
             state_color = {
                 SourceState.IDLE:      C['txt2'],
@@ -586,16 +656,14 @@ class GUI(QMainWindow):
                 SourceState.ACTIVE:    C['green'],
                 SourceState.EXHAUSTED: C['red'],
             }.get(st, C['txt'])
-            dir_color = (C['green'] if dir_ == "BUY" else
-                         C['red']   if dir_ == "SELL" else C['txt2'])
 
             vals = [
-                (s["name"][:30],         C['txt']),
-                (f"{s['price']:.5f}",    C['cyan']),
-                (st,                     state_color),
-                (str(rnd) if rnd else "—", C['gold']),
-                (dir_,                   dir_color),
-                (f"{next_lot:.2f}",      C['purple']),
+                (s["name"][:30],            C['txt']),
+                (f"{s['price']:.5f}",       C['cyan']),
+                (st,                        state_color),
+                (str(rnd) if rnd else "—",  C['gold']),
+                (f"{buy_lot:.2f}",          C['green']),
+                (f"{sell_lot:.2f}",         C['red']),
             ]
             for c, (v, clr) in enumerate(vals):
                 it = QTableWidgetItem(v)
@@ -603,9 +671,8 @@ class GUI(QMainWindow):
                 self.src_table.setItem(r, c, it)
 
             if st in (SourceState.PENDING, SourceState.ACTIVE):
-                icon = "🟢" if dir_ == "BUY" else ("🔴" if dir_ == "SELL" else "🟡")
                 active_lines.append(
-                    f"{icon} {s['name'][:16]} R{rnd} {dir_} lot={next_lot:.2f}")
+                    f"📌 {s['name'][:14]} R{rnd} | BUY {buy_lot:.2f} SELL {sell_lot:.2f}")
 
         self.lbl_sequences.setText(
             "\n".join(active_lines) if active_lines else "—  No active sequences"
@@ -636,7 +703,7 @@ class GUI(QMainWindow):
     def _refresh_orders(self):
         sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
         try:
-            # Pending
+            # Pending orders
             orders   = mt5.orders_get(symbol=sym) or []
             bot_ord  = [o for o in orders if o.magic == MAGIC_NUMBER]
             self.tbl_pending.setRowCount(len(bot_ord))
@@ -647,11 +714,12 @@ class GUI(QMainWindow):
                                         "BUY-STOP" if is_buy else "SELL-STOP",
                                         f"{o.price_open:.5f}",
                                         f"{o.sl:.5f}",
+                                        f"{o.volume_current:.2f}",
                                         f"{o.tp:.5f}"]):
                     it = QTableWidgetItem(v); it.setForeground(clr)
                     self.tbl_pending.setItem(r, c, it)
 
-            # Positions
+            # Open positions
             positions = mt5.positions_get(symbol=sym) or []
             bot_pos   = [p for p in positions if p.magic == MAGIC_NUMBER]
             self.tbl_positions.setRowCount(len(bot_pos))
@@ -679,26 +747,30 @@ class GUI(QMainWindow):
             self._ord_cards["total_pnl"].setText(f"{total_pnl:+.2f}")
             self._ord_cards["total_pnl"].setStyleSheet(
                 f"color:{pnl_color};font-size:15px;font-weight:bold;font-family:Consolas;")
+
+            # Update balance display
+            acct = mt5.account_info()
+            if acct:
+                pct    = self.spin_balance_tp.value()
+                target = acct.balance * (1 + pct / 100) if not hasattr(self, '_start_bal') else \
+                         getattr(self, '_start_bal', acct.balance) * (1 + pct / 100)
+                self.lbl_balance.setText(f"Balance: {acct.balance:.2f} USD")
+                self.lbl_balance_target.setText(
+                    f"Target: {target:.2f} USD  (+{pct:.0f}%)")
         except Exception:
             pass
 
+    def _on_fvg_settings_changed(self):
+        """Hot-update FVG watcher when spinboxes change."""
+        if self._fvg_worker:
+            self._fvg_worker.update_settings(
+                min_gap_pips = self.spin_fvg_gap.value(),
+                lookback     = self.spin_fvg_lookback.value(),
+                max_draw     = self.spin_fvg_max.value(),
+            )
+
     def _on_symbol_changed(self, sym: str):
         self.lbl_sym_hdr.setText(sym)
-
-    def _update_lot_preview(self):
-        base  = self.spin_lot.value()
-        mult  = self.spin_mult.value()
-        maxr  = self.spin_rounds.value()
-        lines = []
-        lot   = base
-        for i in range(1, maxr + 1):
-            lines.append(f"R{i}: {lot:.2f}")
-            lot = round(lot * mult, 2)
-        # 5 per row
-        rows = []
-        for i in range(0, len(lines), 5):
-            rows.append("  ".join(lines[i:i+5]))
-        self.lbl_lots.setText("\n".join(rows))
 
     def _init_price(self):
         sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
@@ -713,8 +785,6 @@ class GUI(QMainWindow):
     def closeEvent(self, event):
         self._stop()
         event.accept()
-
-
 # ── Entry Point ───────────────────────────────────────────────────
 def main():
     app = QApplication(sys.argv)

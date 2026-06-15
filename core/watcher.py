@@ -185,19 +185,41 @@ class WatcherSignals:
 
 class WatcherThread(threading.Thread):
 
-    def __init__(self, symbol: str, lot_size: float, follow_enabled: bool = True):
+    def __init__(self, symbol: str, lot_size: float,
+                 follow_enabled: bool = True, resume_enabled: bool = False):
         super().__init__(daemon=True)
-        self.symbol         = symbol
-        self.lot_size       = lot_size
-        self.follow_enabled = follow_enabled
-        self.sig            = WatcherSignals()
-        self._stop_event    = threading.Event()
+        self.symbol          = symbol
+        self.lot_size        = lot_size
+        self.follow_enabled  = follow_enabled
+        self._resume_enabled = resume_enabled
+        self.sig             = WatcherSignals()
+        self._stop_event     = threading.Event()
         self._sources: dict[str, SourceState] = {}
         self._seen:    set = set()
         self._skipped: set = set()
 
     def stop(self):
         self._stop_event.set()
+
+    def _save_start_balance(self, path: str, json_mod):
+        """Persist start balance to file so restarts don't reset the target."""
+        try:
+            with open(path, "w") as f:
+                json_mod.dump({"start_balance": self._start_balance,
+                               "symbol": self.symbol}, f)
+        except Exception as e:
+            log.warning("Could not save start balance: %s", e)
+
+    def _clear_start_balance(self, symbol: str):
+        """Call this when balance TP is hit to reset for the next session."""
+        import os as _os2
+        path = f"start_balance_{symbol}.json"
+        try:
+            if _os2.path.exists(path):
+                _os2.remove(path)
+                log.info("Start balance file cleared for next session")
+        except Exception:
+            pass
 
     def log(self, msg: str, level: str = "INFO"):
         ts = datetime.now().strftime("%H:%M:%S")
@@ -216,8 +238,67 @@ class WatcherThread(threading.Thread):
         pip = get_pip_size(self.symbol)
         self.log(f"Symbol: {self.symbol}  pip={pip:.5f}  "
                  f"order_dist={cfg.ORDER_DISTANCE_PIPS}pips={cfg.ORDER_DISTANCE_PIPS*pip:.5f}")
+
+        # ── Start balance (session-persistent) ───────────────────
+        # The target is based on the ORIGINAL session start balance.
+        # We save it to a file on first start and always reload it,
+        # so restarting the bot never resets the profit target.
+        # Only cleared when balance TP is hit or user manually deletes the file.
+        acct            = mt5.account_info()
+        current_balance = acct.balance if acct else 0.0
+
+        import json as _json
+        _bal_file = f"start_balance_{self.symbol}.json"
+
+        if _os.path.exists(_bal_file):
+            try:
+                with open(_bal_file) as f:
+                    saved = _json.load(f)
+                saved_bal = saved.get("start_balance", 0.0)
+                # Only use saved balance if it's higher than current
+                # (if current is higher, a new session started with more funds)
+                if saved_bal > 0 and saved_bal <= current_balance * 1.5:
+                    self._start_balance = saved_bal
+                    self.log(
+                        f"💰  Session start balance: {self._start_balance:.2f} | "
+                        f"Current: {current_balance:.2f} | "
+                        f"Target: {self._start_balance * cfg.BALANCE_TP_RATIO:.2f} "
+                        f"(+{(cfg.BALANCE_TP_RATIO-1)*100:.0f}%)"
+                    )
+                else:
+                    raise ValueError("saved balance out of range")
+            except Exception:
+                self._start_balance = current_balance
+                self._save_start_balance(_bal_file, _json)
+        else:
+            self._start_balance = current_balance
+            self._save_start_balance(_bal_file, _json)
+            self.log(
+                f"💰  Start balance: {self._start_balance:.2f} | "
+                f"Target: {self._start_balance * cfg.BALANCE_TP_RATIO:.2f} "
+                f"(+{(cfg.BALANCE_TP_RATIO-1)*100:.0f}%)"
+            )
+        # ─────────────────────────────────────────────────────────
+
         self.log("⏳  Waiting for ObjectExporter EA file…")
         self.sig.emit_status("⏳  Waiting for EA…")
+
+        # ── Resume previous session if positions/orders exist ─────
+        if self._resume_enabled:
+            from core.resume import scan_and_resume
+            recovered = scan_and_resume(
+                symbol        = self.symbol,
+                dist_pips     = cfg.ORDER_DISTANCE_PIPS,
+                pip_size      = pip,
+                base_lot      = self.lot_size,
+                start_balance = self._start_balance,
+                log_fn        = self.log,
+                stop_fn       = self.stop,
+            )
+            for name, state in recovered:
+                self._sources[name] = state
+                self._seen.add(name)
+        # ─────────────────────────────────────────────────────────
 
         warned_missing = stale_warned = False
         last_ea_warn   = None
@@ -305,13 +386,15 @@ class WatcherThread(threading.Thread):
 
                     if src is not None:
                         state = SourceState(
-                            name      = n,
-                            price     = src,
-                            pip_size  = pip,
-                            symbol    = self.symbol,
-                            base_lot  = self.lot_size,
-                            dist_pips = dist_pips,   # ← pass current GUI value
-                            log_fn    = self.log,
+                            name          = n,
+                            price         = src,
+                            pip_size      = pip,
+                            symbol        = self.symbol,
+                            base_lot      = self.lot_size,
+                            dist_pips     = dist_pips,
+                            start_balance = self._start_balance,
+                            log_fn        = self.log,
+                            stop_fn       = self.stop,
                         )
                         state.registered_at = cur_t
                         state.last_prev_t   = prev_t
@@ -325,6 +408,10 @@ class WatcherThread(threading.Thread):
                 # ── Removed lines ─────────────────────────────────
                 for n in list(self._sources.keys()):
                     if n not in cur_names:
+                        # Resumed states have no chart object — never delete them
+                        # based on object list; they self-terminate when positions close
+                        if n.startswith("RESUMED_"):
+                            continue
                         self.log(f"🗑️  [{n[:25]}] removed — cancelling orders")
                         self._sources[n].reset()
                         del self._sources[n]
@@ -336,6 +423,9 @@ class WatcherThread(threading.Thread):
                         n = o.name
                         if n not in self._sources:
                             continue
+                        # Resumed states are not tied to a chart object
+                        if n.startswith("RESUMED_"):
+                            continue
                         state = self._sources[n]
                         new_price = None
                         if o.is_hline:
@@ -346,7 +436,7 @@ class WatcherThread(threading.Thread):
                             self.log(f"↕️  [{n[:25]}] moved {state.price:.5f}→{new_price:.5f} — resetting")
                             state.reset()
                             state.price         = new_price
-                            state.dist_pips     = dist_pips   # update dist on move too
+                            state.dist_pips     = dist_pips
                             state.registered_at = cur_t
                             state.last_prev_t   = prev_t
 
@@ -379,9 +469,14 @@ class WatcherThread(threading.Thread):
                         state.place_initial_pair()
 
                 # ── Monitor active/pending states ─────────────────
-                for n, state in self._sources.items():
+                for n, state in list(self._sources.items()):
                     if state.state in (SourceState.PENDING, SourceState.ACTIVE):
                         state.check(candle)
+                    # Auto-remove exhausted resumed states (no chart object to remove them)
+                    if n.startswith("RESUMED_") and state.state == SourceState.EXHAUSTED:
+                        self.log(f"✅  [{n[:25]}] resumed sequence complete — removing", "INFO")
+                        del self._sources[n]
+                        self._seen.discard(n)
 
                 # ── Emit state to GUI ─────────────────────────────
                 self.sig.emit_state([s.summary for s in self._sources.values()])

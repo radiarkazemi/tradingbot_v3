@@ -26,6 +26,15 @@ import time as _time
 from config import MAGIC_NUMBER
 from core.order_manager import send_pair, cancel_order, _filling_mode, _round_price
 
+
+def _save(state):
+    """Save session state — imported lazily to avoid circular import."""
+    try:
+        from core.resume import save_session
+        save_session(state)
+    except Exception:
+        pass
+
 log = logging.getLogger("monitor_v2")
 
 ACTIVATION_GRACE_SEC = 5
@@ -288,6 +297,7 @@ class SourceState:
             )
 
         self.state = self.ACTIVE
+        _save(self)
 
     # ── Active leg monitoring ─────────────────────────────────────
 
@@ -448,10 +458,7 @@ class SourceState:
                 f"entry={self._buy_entry:.5f} sl={self._buy_sl_price:.5f} "
                 f"lot={self.buy_lot:.2f} | SELL lot → {self.sell_lot:.2f}", "NEW"
             )
-        else:
-            r = results[0] if results else {}
-            self._log(f"❌  [{self.name[:20]}] R{self.round} BUY-STOP FAILED "
-                      f"({r.get('reason','unknown')})", "ERROR")
+            _save(self)
 
     def _place_new_sell_stop(self):
         self.round   += 1
@@ -481,10 +488,7 @@ class SourceState:
                 f"entry={self._sell_entry:.5f} sl={self._sell_sl_price:.5f} "
                 f"lot={self.sell_lot:.2f} | BUY lot → {self.buy_lot:.2f}", "NEW"
             )
-        else:
-            r = results[0] if results else {}
-            self._log(f"❌  [{self.name[:20]}] R{self.round} SELL-STOP FAILED "
-                      f"({r.get('reason','unknown')})", "ERROR")
+            _save(self)
 
     # ── Order lot modification ────────────────────────────────────
 
@@ -577,6 +581,12 @@ class SourceState:
         self._buy_confirmed  = False
         self._sell_confirmed = False
         self._log(f"🔄  [{self.name[:20]}] state reset to IDLE")
+        # Clear session file on manual reset
+        try:
+            from core.resume import clear_session
+            clear_session(self.symbol)
+        except Exception:
+            pass
 
     @property
     def summary(self) -> dict:

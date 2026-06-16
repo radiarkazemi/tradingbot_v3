@@ -240,37 +240,38 @@ class WatcherThread(threading.Thread):
                  f"order_dist={cfg.ORDER_DISTANCE_PIPS}pips={cfg.ORDER_DISTANCE_PIPS*pip:.5f}")
 
         # ── Start balance (session-persistent) ───────────────────
-        # The target is based on the ORIGINAL session start balance.
-        # We save it to a file on first start and always reload it,
-        # so restarting the bot never resets the profit target.
-        # Only cleared when balance TP is hit or user manually deletes the file.
         acct            = mt5.account_info()
         current_balance = acct.balance if acct else 0.0
 
         import json as _json
         _bal_file = f"start_balance_{self.symbol}.json"
 
-        if _os.path.exists(_bal_file):
+        if self._resume_enabled and _os.path.exists(_bal_file):
+            # RESUME MODE: load the original session start balance
             try:
                 with open(_bal_file) as f:
                     saved = _json.load(f)
                 saved_bal = saved.get("start_balance", 0.0)
-                # Only use saved balance if it's higher than current
-                # (if current is higher, a new session started with more funds)
-                if saved_bal > 0 and saved_bal <= current_balance * 1.5:
+                if saved_bal > 0:
                     self._start_balance = saved_bal
                     self.log(
-                        f"💰  Session start balance: {self._start_balance:.2f} | "
+                        f"💰  Resumed start balance: {self._start_balance:.2f} | "
                         f"Current: {current_balance:.2f} | "
                         f"Target: {self._start_balance * cfg.BALANCE_TP_RATIO:.2f} "
                         f"(+{(cfg.BALANCE_TP_RATIO-1)*100:.0f}%)"
                     )
                 else:
-                    raise ValueError("saved balance out of range")
+                    raise ValueError("invalid saved balance")
             except Exception:
                 self._start_balance = current_balance
                 self._save_start_balance(_bal_file, _json)
+                self.log(
+                    f"💰  Start balance: {self._start_balance:.2f} | "
+                    f"Target: {self._start_balance * cfg.BALANCE_TP_RATIO:.2f} "
+                    f"(+{(cfg.BALANCE_TP_RATIO-1)*100:.0f}%)"
+                )
         else:
+            # FRESH START: always use current balance, overwrite any old file
             self._start_balance = current_balance
             self._save_start_balance(_bal_file, _json)
             self.log(

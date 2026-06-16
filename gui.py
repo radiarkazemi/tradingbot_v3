@@ -751,12 +751,28 @@ class GUI(QMainWindow):
             # Update balance display
             acct = mt5.account_info()
             if acct:
-                pct    = self.spin_balance_tp.value()
-                target = acct.balance * (1 + pct / 100) if not hasattr(self, '_start_bal') else \
-                         getattr(self, '_start_bal', acct.balance) * (1 + pct / 100)
-                self.lbl_balance.setText(f"Balance: {acct.balance:.2f} USD")
+                # Load session start balance from file (same file watcher.py saves)
+                sym          = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+                pct          = self.spin_balance_tp.value()
+                start_bal    = acct.balance  # fallback
+                try:
+                    import json as _json, os as _os
+                    _f = f"start_balance_{sym}.json"
+                    if _os.path.exists(_f):
+                        saved = _json.load(open(_f))
+                        start_bal = saved.get("start_balance", acct.balance)
+                except Exception:
+                    pass
+                target = start_bal * (1.0 + pct / 100.0)
+                profit = acct.balance - start_bal
+                profit_color = C['green'] if profit >= 0 else C['red']
+                self.lbl_balance.setText(
+                    f"Balance: {acct.balance:.2f}  "
+                    f"<span style='color:{profit_color};'>({profit:+.2f})</span>"
+                )
                 self.lbl_balance_target.setText(
-                    f"Target: {target:.2f} USD  (+{pct:.0f}%)")
+                    f"Start: {start_bal:.2f}  Target: {target:.2f}  (+{pct:.0f}%)"
+                )
         except Exception:
             pass
 

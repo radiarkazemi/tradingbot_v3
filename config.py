@@ -34,7 +34,9 @@ MAGIC_NUMBER    = 998877        # unique ID so bot can identify its own orders
 # Prefixes of auto-drawn or indicator objects to ignore
 AUTO_OBJECT_PREFIXES = [
     "PA_", "CT", "GB_", "TB2_", "autotrade",
-    "FVG_",   # FVG detector rectangles — never treat as trade signals
+    "FVG_",    # FVG detector rectangles
+    "OB_",     # Order Block rectangles
+    "OBFVG_",  # OB+FVG Confluence rectangles
 ]
 
 BOT_LINE_PREFIX = "TB2_"        # prefix for bot-drawn lines

@@ -131,8 +131,10 @@ class SourceState:
             self.state = self.PENDING
             self._log(
                 f"📌  [{self.name[:20]}] R1 pair placed | "
-                f"BUY#{self.buy_ticket}@{self._buy_entry:.5f} sl={self._buy_sl_price:.5f} lot={self.buy_lot:.2f} | "
-                f"SELL#{self.sell_ticket}@{self._sell_entry:.5f} sl={self._sell_sl_price:.5f} lot={self.sell_lot:.2f}", "NEW"
+                f"BUY#{self.buy_ticket}@{self._buy_entry:.5f} "
+                f"sl={self._buy_sl_price:.5f} lot={self.buy_lot:.2f} | "
+                f"SELL#{self.sell_ticket}@{self._sell_entry:.5f} "
+                f"sl={self._sell_sl_price:.5f} lot={self.sell_lot:.2f}", "NEW"
             )
         else:
             self._log(f"❌  [{self.name[:20]}] failed to place initial pair", "ERROR")
@@ -180,6 +182,8 @@ class SourceState:
     def _close_all_and_stop(self):
         filling = _filling_mode(self.symbol)
         tick    = mt5.symbol_info_tick(self.symbol)
+
+        # Close all open positions
         for p in (mt5.positions_get(symbol=self.symbol) or []):
             if p.magic != MAGIC_NUMBER:
                 continue
@@ -200,10 +204,13 @@ class SourceState:
                 self._log(f"✅  Closed #{p.ticket}", "NEW")
             else:
                 self._log(f"⚠️  Failed to close #{p.ticket}", "WARN")
+
+        # Cancel all pending orders
         for o in (mt5.orders_get(symbol=self.symbol) or []):
             if o.magic == MAGIC_NUMBER:
                 cancel_order(o.ticket)
-        # Delete saved start balance — next session starts fresh
+
+        # Delete saved start balance so next session starts fresh
         import os as _os
         _bal_file = f"start_balance_{self.symbol}.json"
         try:
@@ -212,18 +219,17 @@ class SourceState:
                 self._log(f"🗑️  Cleared saved start balance (session complete)", "INFO")
         except Exception:
             pass
+
         self.state = self.EXHAUSTED
+
+        # Signal the watcher to stop cleanly.
+        # The watcher's _on_balance_tp() sets its stop event and emits
+        # sig.emit_stop() so the GUI can stop FVG/OB/Confluence watchers
+        # before mt5.shutdown() is called at the end of watcher.run().
+        # DO NOT call mt5.shutdown() here — the connection must stay alive
+        # until the watcher loop exits naturally.
         if self._stop_fn:
             self._stop_fn()
-        # Clear saved start balance so next session starts fresh
-        import os as _os
-        _bal_file = f"start_balance_{self.symbol}.json"
-        try:
-            if _os.path.exists(_bal_file):
-                _os.remove(_bal_file)
-                self._log("💾  Session balance file cleared — next session starts fresh", "INFO")
-        except Exception:
-            pass
 
     # ── Activation ────────────────────────────────────────────────
 
@@ -322,7 +328,10 @@ class SourceState:
                 self.buy_sl         = pos.sl
                 self.buy_lot        = pos.volume
                 self._buy_confirmed = True
-                self._log(f"🔍  [{self.name[:20]}] BUY pos confirmed #{pos.ticket} sl={pos.sl}", "INFO")
+                self._log(
+                    f"🔍  [{self.name[:20]}] BUY pos confirmed "
+                    f"#{pos.ticket} sl={pos.sl}", "INFO"
+                )
 
         if not self._sell_confirmed and self.sell_pos_ticket is None:
             if sell_pos:
@@ -331,7 +340,10 @@ class SourceState:
                 self.sell_sl         = pos.sl
                 self.sell_lot        = pos.volume
                 self._sell_confirmed = True
-                self._log(f"🔍  [{self.name[:20]}] SELL pos confirmed #{pos.ticket} sl={pos.sl}", "INFO")
+                self._log(
+                    f"🔍  [{self.name[:20]}] SELL pos confirmed "
+                    f"#{pos.ticket} sl={pos.sl}", "INFO"
+                )
 
         # ── Second activation (pending stop filled) ───────────────
         if (self.buy_ticket and self.buy_ticket not in pending
@@ -385,7 +397,9 @@ class SourceState:
         if (self.buy_pos_ticket
                 and self.buy_pos_ticket not in open_tickets
                 and self._buy_confirmed):
-            self._log(f"📉  [{self.name[:20]}] BUY pos#{self.buy_pos_ticket} closed", "WARN")
+            self._log(
+                f"📉  [{self.name[:20]}] BUY pos#{self.buy_pos_ticket} closed", "WARN"
+            )
             self.buy_pos_ticket = None
             self._buy_confirmed = False
             self._place_new_buy_stop()
@@ -393,7 +407,9 @@ class SourceState:
         if (self.sell_pos_ticket
                 and self.sell_pos_ticket not in open_tickets
                 and self._sell_confirmed):
-            self._log(f"📉  [{self.name[:20]}] SELL pos#{self.sell_pos_ticket} closed", "WARN")
+            self._log(
+                f"📉  [{self.name[:20]}] SELL pos#{self.sell_pos_ticket} closed", "WARN"
+            )
             self.sell_pos_ticket = None
             self._sell_confirmed = False
             self._place_new_sell_stop()
@@ -401,11 +417,6 @@ class SourceState:
     # ── New stop placement ────────────────────────────────────────
 
     def _can_afford(self, lot: float, is_buy: bool) -> bool:
-        """
-        Check if the account has enough free margin to place this order.
-        Uses MT5's own margin calculator. Returns False if margin would
-        drop below 20% of equity (safety buffer).
-        """
         try:
             action = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
             tick   = mt5.symbol_info_tick(self.symbol)
@@ -413,10 +424,10 @@ class SourceState:
             margin = mt5.order_calc_margin(action, self.symbol, lot, price)
             acct   = mt5.account_info()
             if margin is None or acct is None:
-                return True  # can't check — allow and let MT5 reject if needed
+                return True
             free_margin   = acct.margin_free
             equity        = acct.equity
-            safety_margin = equity * 0.20  # keep 20% equity as buffer
+            safety_margin = equity * 0.20
             if free_margin - margin < safety_margin:
                 self._log(
                     f"🛡️  [{self.name[:20]}] R{self.round} MARGIN PROTECTION | "
@@ -428,7 +439,7 @@ class SourceState:
             return True
         except Exception as e:
             log.warning("Margin check error: %s", e)
-            return True  # allow on error
+            return True
 
     def _place_new_buy_stop(self):
         self.round  += 1
@@ -436,7 +447,7 @@ class SourceState:
         self.buy_lot = max(new_buy_lot, 0.01)
 
         if not self._can_afford(self.buy_lot, is_buy=True):
-            return  # keep SELL position running, no new BUY
+            return
 
         order = {"type": "BUY_STOP", "entry": self._buy_entry,
                  "sl": self._buy_sl_price, "tp": 0.0,
@@ -466,7 +477,7 @@ class SourceState:
         self.sell_lot = max(new_sell_lot, 0.01)
 
         if not self._can_afford(self.sell_lot, is_buy=False):
-            return  # keep BUY position running, no new SELL
+            return
 
         order = {"type": "SELL_STOP", "entry": self._sell_entry,
                  "sl": self._sell_sl_price, "tp": 0.0,
@@ -497,7 +508,9 @@ class SourceState:
         orders = mt5.orders_get(symbol=self.symbol) or []
         target = next((o for o in orders if o.ticket == ticket), None)
         if not target:
-            self._log(f"ℹ️  [{self.name[:20]}] order #{ticket} already filled", "INFO")
+            self._log(
+                f"ℹ️  [{self.name[:20]}] order #{ticket} already filled", "INFO"
+            )
             return False
 
         cancel_order(ticket)
@@ -529,8 +542,10 @@ class SourceState:
                 "comment":      (target.comment or "") + "m",
                 "type_filling": filling,
             }
-            self._log(f"⚡  [{self.name[:20]}] {'BUY' if is_buy else 'SELL'} past market — "
-                      f"MARKET lot={new_lot:.2f} sl={use_sl:.5f}", "WARN")
+            self._log(
+                f"⚡  [{self.name[:20]}] {'BUY' if is_buy else 'SELL'} past market — "
+                f"MARKET lot={new_lot:.2f} sl={use_sl:.5f}", "WARN"
+            )
         else:
             request = {
                 "action":       mt5.TRADE_ACTION_PENDING,
@@ -555,11 +570,14 @@ class SourceState:
                 self.sell_ticket = res.order
             self._log(
                 f"✏️  [{self.name[:20]}] {'BUY' if is_buy else 'SELL'}-STOP modified | "
-                f"ticket#{res.order} lot={new_lot:.2f} sl={use_sl:.5f} @ {entry:.5f}", "INFO"
+                f"ticket#{res.order} lot={new_lot:.2f} sl={use_sl:.5f} @ {entry:.5f}",
+                "INFO"
             )
             return True
         else:
-            self._log(f"❌  Modify failed: {res.retcode if res else '?'}", "ERROR")
+            self._log(
+                f"❌  Modify failed: {res.retcode if res else '?'}", "ERROR"
+            )
             return False
 
     # ── Reset ─────────────────────────────────────────────────────
@@ -581,7 +599,6 @@ class SourceState:
         self._buy_confirmed  = False
         self._sell_confirmed = False
         self._log(f"🔄  [{self.name[:20]}] state reset to IDLE")
-        # Clear session file on manual reset
         try:
             from core.resume import clear_session
             clear_session(self.symbol)

@@ -21,12 +21,17 @@ from core.position_monitor import SourceState
 
 log = logging.getLogger("watcher_v2")
 
+# How many consecutive scans a line must be absent before we treat it as deleted.
+# At SCAN_INTERVAL_SEC=2, a grace of 3 = 6 seconds.
+# Prevents spurious resets when the EA rewrites the file mid-scan.
+REMOVAL_GRACE = 3
 
-# ── File-bridge helpers (same as v1) ──────────────────────────────
+
+# ── File-bridge helpers ───────────────────────────────────────────
 
 def _get_file_paths(symbol=None):
-    appdata  = _os.environ.get("APPDATA", "")
-    paths    = []
+    appdata   = _os.environ.get("APPDATA", "")
+    paths     = []
     fname_sym = f"trader_objects_{symbol}.txt" if symbol else None
     fname_gen = "trader_objects.txt"
 
@@ -45,8 +50,8 @@ def _get_file_paths(symbol=None):
     except Exception:
         pass
 
-    roaming = _os.path.join(_os.environ.get("USERPROFILE",""),
-                            "AppData","Roaming","MetaQuotes","Terminal")
+    roaming = _os.path.join(_os.environ.get("USERPROFILE", ""),
+                            "AppData", "Roaming", "MetaQuotes", "Terminal")
     try:
         if _os.path.isdir(roaming):
             for tid in _os.listdir(roaming):
@@ -110,10 +115,13 @@ class ChartObject:
 
 
 def _parse_file(path: str):
-    """Returns (objects, candle_dict, file_symbol)"""
+    """Returns (objects, candle_dict, file_symbol)."""
     try:
         with open(path, encoding="utf-8", errors="ignore") as f:
             lines = f.readlines()
+    except PermissionError:
+        # EA is writing the file at this exact moment — transient, skip silently.
+        return [], {}, None
     except Exception as e:
         log.warning("Could not read %s: %s", path, e)
         return [], {}, None
@@ -162,11 +170,13 @@ class WatcherSignals:
         self._status_cbs = []
         self._state_cbs  = []
         self._candle_cbs = []
+        self._stop_cbs   = []   # called when balance TP fires
 
     def on_log(self, fn):    self._log_cbs.append(fn)
     def on_status(self, fn): self._status_cbs.append(fn)
     def on_state(self, fn):  self._state_cbs.append(fn)
     def on_candle(self, fn): self._candle_cbs.append(fn)
+    def on_stop(self, fn):   self._stop_cbs.append(fn)   # GUI registers here
 
     def emit_log(self, msg, level="INFO"):
         for fn in self._log_cbs: fn(msg, level)
@@ -179,6 +189,9 @@ class WatcherSignals:
 
     def emit_candle(self, candle):
         for fn in self._candle_cbs: fn(candle)
+
+    def emit_stop(self):
+        for fn in self._stop_cbs: fn()
 
 
 # ── Watcher Thread ────────────────────────────────────────────────
@@ -198,11 +211,25 @@ class WatcherThread(threading.Thread):
         self._seen:    set = set()
         self._skipped: set = set()
 
+        # Grace period: name → consecutive absent-scan count.
+        # Line must be missing REMOVAL_GRACE scans before we reset it.
+        self._missing_counts: dict[str, int] = {}
+
     def stop(self):
         self._stop_event.set()
 
+    def _on_balance_tp(self):
+        """
+        Called by SourceState when balance TP is hit.
+        Sets the stop event so the main loop exits cleanly.
+        mt5.shutdown() is handled at the end of run() — not here —
+        so FVG/OB watchers are stopped by the GUI before MT5 closes.
+        """
+        self._stop_event.set()
+        # Tell the GUI to stop all watchers cleanly (FVG, OB, Confluence)
+        self.sig.emit_stop()
+
     def _save_start_balance(self, path: str, json_mod):
-        """Persist start balance to file so restarts don't reset the target."""
         try:
             with open(path, "w") as f:
                 json_mod.dump({"start_balance": self._start_balance,
@@ -210,22 +237,11 @@ class WatcherThread(threading.Thread):
         except Exception as e:
             log.warning("Could not save start balance: %s", e)
 
-    def _clear_start_balance(self, symbol: str):
-        """Call this when balance TP is hit to reset for the next session."""
-        import os as _os2
-        path = f"start_balance_{symbol}.json"
-        try:
-            if _os2.path.exists(path):
-                _os2.remove(path)
-                log.info("Start balance file cleared for next session")
-        except Exception:
-            pass
-
     def log(self, msg: str, level: str = "INFO"):
         ts = datetime.now().strftime("%H:%M:%S")
         self.sig.emit_log(f"{ts}  {msg}", level)
         getattr(log, "warning" if level == "WARN" else
-                     level.lower() if level.lower() in ("info","error","debug") else "info")(msg)
+                     level.lower() if level.lower() in ("info", "error", "debug") else "info")(msg)
 
     def run(self):
         self.log("=" * 60)
@@ -237,9 +253,10 @@ class WatcherThread(threading.Thread):
 
         pip = get_pip_size(self.symbol)
         self.log(f"Symbol: {self.symbol}  pip={pip:.5f}  "
-                 f"order_dist={cfg.ORDER_DISTANCE_PIPS}pips={cfg.ORDER_DISTANCE_PIPS*pip:.5f}")
+                 f"order_dist={cfg.ORDER_DISTANCE_PIPS}pips"
+                 f"={cfg.ORDER_DISTANCE_PIPS * pip:.5f}")
 
-        # ── Start balance (session-persistent) ───────────────────
+        # ── Start balance ─────────────────────────────────────────
         acct            = mt5.account_info()
         current_balance = acct.balance if acct else 0.0
 
@@ -247,7 +264,6 @@ class WatcherThread(threading.Thread):
         _bal_file = f"start_balance_{self.symbol}.json"
 
         if self._resume_enabled and _os.path.exists(_bal_file):
-            # RESUME MODE: load the original session start balance
             try:
                 with open(_bal_file) as f:
                     saved = _json.load(f)
@@ -258,7 +274,7 @@ class WatcherThread(threading.Thread):
                         f"💰  Resumed start balance: {self._start_balance:.2f} | "
                         f"Current: {current_balance:.2f} | "
                         f"Target: {self._start_balance * cfg.BALANCE_TP_RATIO:.2f} "
-                        f"(+{(cfg.BALANCE_TP_RATIO-1)*100:.0f}%)"
+                        f"(+{(cfg.BALANCE_TP_RATIO - 1) * 100:.0f}%)"
                     )
                 else:
                     raise ValueError("invalid saved balance")
@@ -268,23 +284,21 @@ class WatcherThread(threading.Thread):
                 self.log(
                     f"💰  Start balance: {self._start_balance:.2f} | "
                     f"Target: {self._start_balance * cfg.BALANCE_TP_RATIO:.2f} "
-                    f"(+{(cfg.BALANCE_TP_RATIO-1)*100:.0f}%)"
+                    f"(+{(cfg.BALANCE_TP_RATIO - 1) * 100:.0f}%)"
                 )
         else:
-            # FRESH START: always use current balance, overwrite any old file
             self._start_balance = current_balance
             self._save_start_balance(_bal_file, _json)
             self.log(
                 f"💰  Start balance: {self._start_balance:.2f} | "
                 f"Target: {self._start_balance * cfg.BALANCE_TP_RATIO:.2f} "
-                f"(+{(cfg.BALANCE_TP_RATIO-1)*100:.0f}%)"
+                f"(+{(cfg.BALANCE_TP_RATIO - 1) * 100:.0f}%)"
             )
-        # ─────────────────────────────────────────────────────────
 
         self.log("⏳  Waiting for ObjectExporter EA file…")
         self.sig.emit_status("⏳  Waiting for EA…")
 
-        # ── Resume previous session if positions/orders exist ─────
+        # ── Resume previous session ───────────────────────────────
         if self._resume_enabled:
             from core.resume import scan_and_resume
             recovered = scan_and_resume(
@@ -294,27 +308,26 @@ class WatcherThread(threading.Thread):
                 base_lot      = self.lot_size,
                 start_balance = self._start_balance,
                 log_fn        = self.log,
-                stop_fn       = self.stop,
+                stop_fn       = self._on_balance_tp,
             )
             for name, state in recovered:
                 self._sources[name] = state
                 self._seen.add(name)
-        # ─────────────────────────────────────────────────────────
 
         warned_missing = stale_warned = False
         last_ea_warn   = None
 
         while not self._stop_event.is_set():
             try:
-                # Read dist_pips fresh every cycle from config
-                # (so GUI changes take effect immediately)
                 dist_pips = cfg.ORDER_DISTANCE_PIPS
-
-                path = _find_objects_file(self.symbol)
+                path      = _find_objects_file(self.symbol)
 
                 if path is None:
                     if not warned_missing:
-                        self.log("⚠️  trader_objects.txt not found — is ObjectExporter EA running?", "WARN")
+                        self.log(
+                            "⚠️  trader_objects.txt not found — "
+                            "is ObjectExporter EA running?", "WARN"
+                        )
                         warned_missing = True
                     self.sig.emit_status("⏳  Waiting for EA…")
                     self._stop_event.wait(cfg.SCAN_INTERVAL_SEC)
@@ -341,10 +354,17 @@ class WatcherThread(threading.Thread):
 
                 objects, candle, ea_sym = _parse_file(path)
 
+                # _parse_file returns empty on PermissionError — skip silently
+                if objects is None and candle is None:
+                    self._stop_event.wait(cfg.SCAN_INTERVAL_SEC)
+                    continue
+
                 if ea_sym and ea_sym != self.symbol:
                     if ea_sym != last_ea_warn:
                         last_ea_warn = ea_sym
-                        self.log(f"⚠️  EA on '{ea_sym}' — bot watching '{self.symbol}'", "WARN")
+                        self.log(
+                            f"⚠️  EA on '{ea_sym}' — bot watching '{self.symbol}'", "WARN"
+                        )
                     self.sig.emit_status(f"⚠️  EA on wrong chart ({ea_sym})")
                     self._stop_event.wait(cfg.SCAN_INTERVAL_SEC)
                     continue
@@ -395,28 +415,36 @@ class WatcherThread(threading.Thread):
                             dist_pips     = dist_pips,
                             start_balance = self._start_balance,
                             log_fn        = self.log,
-                            stop_fn       = self.stop,
+                            stop_fn       = self._on_balance_tp,
                         )
                         state.registered_at = cur_t
                         state.last_prev_t   = prev_t
-                        self._sources[n] = state
+                        self._sources[n]    = state
                         self._seen.add(n)
                         self.log(
                             f"🆕  [{n[:25]}] @ {src:.5f} registered | "
                             f"dist={dist_pips}pips | waiting for candle touch"
                         )
 
-                # ── Removed lines ─────────────────────────────────
+                # ── Removed lines (with grace period) ─────────────
+                # A line must be absent for REMOVAL_GRACE consecutive scans
+                # before we reset it. Prevents false resets when the EA
+                # briefly clears the file while rewriting it.
                 for n in list(self._sources.keys()):
                     if n not in cur_names:
-                        # Resumed states have no chart object — never delete them
-                        # based on object list; they self-terminate when positions close
                         if n.startswith("RESUMED_"):
                             continue
-                        self.log(f"🗑️  [{n[:25]}] removed — cancelling orders")
-                        self._sources[n].reset()
-                        del self._sources[n]
-                        self._seen.discard(n)
+                        self._missing_counts[n] = self._missing_counts.get(n, 0) + 1
+                        if self._missing_counts[n] >= REMOVAL_GRACE:
+                            self.log(f"🗑️  [{n[:25]}] removed — cancelling orders")
+                            self._sources[n].reset()
+                            del self._sources[n]
+                            self._seen.discard(n)
+                            self._missing_counts.pop(n, None)
+                        # else: absent within grace — silently wait
+                    else:
+                        # Present this scan — clear any pending removal counter
+                        self._missing_counts.pop(n, None)
 
                 # ── Moved lines ───────────────────────────────────
                 if self.follow_enabled:
@@ -424,31 +452,35 @@ class WatcherThread(threading.Thread):
                         n = o.name
                         if n not in self._sources:
                             continue
-                        # Resumed states are not tied to a chart object
                         if n.startswith("RESUMED_"):
                             continue
-                        state = self._sources[n]
+                        state     = self._sources[n]
                         new_price = None
                         if o.is_hline:
                             new_price = o.price1
                         elif o.is_rectangle and o.rect_valid:
                             new_price = round((o.rect_top + o.rect_bottom) / 2, 5)
                         if new_price and abs(new_price - state.price) > 1e-6:
-                            self.log(f"↕️  [{n[:25]}] moved {state.price:.5f}→{new_price:.5f} — resetting")
+                            self.log(
+                                f"↕️  [{n[:25]}] moved "
+                                f"{state.price:.5f}→{new_price:.5f} — resetting"
+                            )
                             state.reset()
                             state.price         = new_price
                             state.dist_pips     = dist_pips
                             state.registered_at = cur_t
                             state.last_prev_t   = prev_t
+                            self._missing_counts.pop(n, None)
 
                 # ── Touch detection ───────────────────────────────
                 for n, state in self._sources.items():
                     if state.state != SourceState.IDLE:
                         continue
 
-                    src = state.price
-                    reg = state.registered_at
-                    touched, desc = False, ""
+                    src     = state.price
+                    reg     = state.registered_at
+                    touched = False
+                    desc    = ""
 
                     if cur_h > 0 and cur_t != reg:
                         if cur_l <= src <= cur_h:
@@ -473,9 +505,10 @@ class WatcherThread(threading.Thread):
                 for n, state in list(self._sources.items()):
                     if state.state in (SourceState.PENDING, SourceState.ACTIVE):
                         state.check(candle)
-                    # Auto-remove exhausted resumed states (no chart object to remove them)
                     if n.startswith("RESUMED_") and state.state == SourceState.EXHAUSTED:
-                        self.log(f"✅  [{n[:25]}] resumed sequence complete — removing", "INFO")
+                        self.log(
+                            f"✅  [{n[:25]}] resumed sequence complete — removing", "INFO"
+                        )
                         del self._sources[n]
                         self._seen.discard(n)
 
@@ -498,6 +531,10 @@ class WatcherThread(threading.Thread):
 
             self._stop_event.wait(cfg.SCAN_INTERVAL_SEC)
 
+        # ── Clean shutdown ────────────────────────────────────────
+        # mt5.shutdown() is called here — after the loop exits — so all
+        # watchers have already been stopped by the GUI's _stop() handler
+        # before MT5 loses connection.
         mt5.shutdown()
         self.sig.emit_status("⚫  Stopped")
         self.log("Bot stopped.")
@@ -510,6 +547,9 @@ class WatcherThread(threading.Thread):
             self.sig.emit_status("❌  MT5 connection failed")
             return False
         info = mt5.account_info()
-        self.log(f"✅ Connected: {info.name} | Balance: {info.balance:.2f} {info.currency}")
+        self.log(
+            f"✅ Connected: {info.name} | "
+            f"Balance: {info.balance:.2f} {info.currency}"
+        )
         self.sig.emit_status(f"🟢  Connected — {info.name}")
         return True

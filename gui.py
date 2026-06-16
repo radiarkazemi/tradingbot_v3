@@ -34,8 +34,10 @@ from config import (
 from core.watcher import WatcherThread
 from core.position_monitor import SourceState
 from core.fvg_watcher import FVGWatcher
+from core.ob_watcher import OBWatcher
+from core.confluence_watcher import ConfluenceWatcher
 
-# ── Palette (matches v1 exactly) ─────────────────────────────────
+# ── Palette ───────────────────────────────────────────────────────
 C = {
     "bg":       "#0D1117",
     "panel":    "#161B22",
@@ -55,6 +57,9 @@ C = {
     "cyan":     "#00BCD4",
     "blue":     "#2979FF",
     "purple":   "#B388FF",
+    "aqua":     "#00FFFF",
+    "magenta":  "#FF00FF",
+    "yellow":   "#FFD700",
 }
 
 SS = f"""
@@ -113,10 +118,12 @@ QCheckBox::indicator:checked {{ background:{C['cyan']};border-color:{C['cyan']};
 
 # ── Qt Signal Bridge ──────────────────────────────────────────────
 class Sig(QObject):
-    log_line = pyqtSignal(str, str)
-    status   = pyqtSignal(str)
-    state    = pyqtSignal(list)
-    candle   = pyqtSignal(dict)
+    log_line   = pyqtSignal(str, str)
+    status     = pyqtSignal(str)
+    state      = pyqtSignal(list)
+    candle     = pyqtSignal(dict)
+    balance_tp = pyqtSignal()   # ← NEW: fired when balance TP hit → GUI stops cleanly
+
 # ── Helpers ───────────────────────────────────────────────────────
 def _vline():
     f = QFrame(); f.setFrameShape(QFrame.VLine)
@@ -125,22 +132,28 @@ def _vline():
 def _hline():
     f = QFrame(); f.setFrameShape(QFrame.HLine)
     f.setStyleSheet(f"color:{C['border']};"); return f
+
 # ── Main Window ───────────────────────────────────────────────────
 class GUI(QMainWindow):
 
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TraderBot v2 — 2-Order Martingale")
-        self.setMinimumSize(860, 620)
+        self.setMinimumSize(860, 640)
         self.setStyleSheet(SS)
 
-        self._worker: Optional[WatcherThread] = None
-        self._fvg_worker: Optional[FVGWatcher] = None
+        self._worker:            Optional[WatcherThread]     = None
+        self._fvg_worker:        Optional[FVGWatcher]        = None
+        self._ob_worker:         Optional[OBWatcher]         = None
+        self._confluence_worker: Optional[ConfluenceWatcher] = None
+
         self._sig = Sig()
         self._sig.log_line.connect(self._on_log)
         self._sig.status.connect(self._on_status)
         self._sig.state.connect(self._on_state)
         self._sig.candle.connect(self._on_candle)
+        # ← NEW: balance TP fires on Qt main thread — safe to stop all watchers
+        self._sig.balance_tp.connect(self._on_balance_tp_reached)
 
         self._last_candle: dict = {}
 
@@ -155,6 +168,11 @@ class GUI(QMainWindow):
         self._ot = QTimer()
         self._ot.timeout.connect(self._refresh_orders)
         self._ot.start(3000)
+
+        # Indicator count refresh
+        self._ct = QTimer()
+        self._ct.timeout.connect(self._refresh_indicator_counts)
+        self._ct.start(5000)
 
         QTimer.singleShot(200, self._init_price)
 
@@ -232,7 +250,6 @@ class GUI(QMainWindow):
         grp_ctrl = QGroupBox("⚙️  Bot Control")
         cl = QVBoxLayout(grp_ctrl); cl.setSpacing(6)
 
-        # Symbol
         self.sym_combo = QComboBox(); self.sym_combo.setEditable(True)
         self.sym_combo.addItems([
             "EURUSD", "XAUUSD", "GBPUSD", "USDJPY", "EURUSD_i",
@@ -242,21 +259,17 @@ class GUI(QMainWindow):
         self.sym_combo.currentTextChanged.connect(self._on_symbol_changed)
         _row("🎯 Symbol:", self.sym_combo, cl, "MT5 symbol to watch")
 
-        # Order distance
         self.spin_dist = QDoubleSpinBox()
         self.spin_dist.setRange(0.1, 100.0); self.spin_dist.setSingleStep(0.5)
         self.spin_dist.setValue(ORDER_DISTANCE_PIPS); self.spin_dist.setDecimals(1)
         _row("📏 Distance (pips):", self.spin_dist, cl,
              "Pips above line for BUY-STOP, below for SELL-STOP")
 
-        # Base lot
         self.spin_lot = QDoubleSpinBox()
         self.spin_lot.setRange(0.01, 100.0); self.spin_lot.setSingleStep(0.01)
         self.spin_lot.setValue(LOT_SIZE); self.spin_lot.setDecimals(2)
-        
         _row("📦 Base Lot:", self.spin_lot, cl, "Starting lot size (round 1)")
 
-        # Balance TP %
         self.spin_balance_tp = QDoubleSpinBox()
         self.spin_balance_tp.setRange(1.0, 100.0); self.spin_balance_tp.setSingleStep(1.0)
         self.spin_balance_tp.setValue(10.0); self.spin_balance_tp.setDecimals(1)
@@ -264,14 +277,13 @@ class GUI(QMainWindow):
         _row("💰 Balance TP:", self.spin_balance_tp, cl,
              "Close all & stop when balance grows by this % from start")
 
-        # Follow moved lines
         self.chk_follow = QCheckBox("Follow moved lines")
         self.chk_follow.setChecked(True)
         self.chk_follow.setToolTip(
-            "When you drag a line on the chart, the bot resets and re-watches from the new position")
+            "When you drag a line on the chart, the bot resets and re-watches "
+            "from the new position")
         cl.addWidget(self.chk_follow)
 
-        # Resume previous session
         self.chk_resume = QCheckBox("Resume previous session")
         self.chk_resume.setChecked(False)
         self.chk_resume.setToolTip(
@@ -283,7 +295,6 @@ class GUI(QMainWindow):
 
         cl.addWidget(_hline())
 
-        # Start / Stop
         self.btn_start = QPushButton("▶  Start Watcher")
         self.btn_start.setObjectName("btn_start")
         self.btn_start.setMinimumHeight(38)
@@ -324,13 +335,12 @@ class GUI(QMainWindow):
         grp_fvg = QGroupBox("📐  Fair Value Gaps (FVG)")
         fv = QVBoxLayout(grp_fvg); fv.setSpacing(6)
 
-        # Enable toggle
         self.chk_fvg = QCheckBox("Enable FVG detection")
         self.chk_fvg.setChecked(True)
         self.chk_fvg.setToolTip("Scan candles for FVG patterns and draw rectangles on chart")
+        self.chk_fvg.stateChanged.connect(self._on_fvg_toggled)
         fv.addWidget(self.chk_fvg)
 
-        # Min gap pips (quality filter)
         fvg_gap_row = QHBoxLayout(); fvg_gap_row.setSpacing(8)
         lbl_gap = _lbl("📏 Min Gap (pips):")
         lbl_gap.setFixedWidth(100)
@@ -351,7 +361,6 @@ class GUI(QMainWindow):
         fvg_gap_row.addWidget(self.spin_fvg_gap)
         fv.addLayout(fvg_gap_row)
 
-        # Lookback candles
         fvg_lb_row = QHBoxLayout(); fvg_lb_row.setSpacing(8)
         lbl_lb = _lbl("🕯 Lookback:")
         lbl_lb.setFixedWidth(100)
@@ -365,7 +374,6 @@ class GUI(QMainWindow):
         fvg_lb_row.addWidget(self.spin_fvg_lookback)
         fv.addLayout(fvg_lb_row)
 
-        # Max rectangles to draw
         fvg_max_row = QHBoxLayout(); fvg_max_row.setSpacing(8)
         lbl_max = _lbl("🔲 Max Rects:")
         lbl_max.setFixedWidth(100)
@@ -379,13 +387,173 @@ class GUI(QMainWindow):
         fvg_max_row.addWidget(self.spin_fvg_max)
         fv.addLayout(fvg_max_row)
 
-        # FVG count label
         self.lbl_fvg_count = QLabel("FVGs: —")
         self.lbl_fvg_count.setStyleSheet(
             f"color:{C['cyan']};font-family:Consolas;font-size:10px;")
         fv.addWidget(self.lbl_fvg_count)
 
         vl.addWidget(grp_fvg)
+
+        # ── OB Settings group ─────────────────────────────────────
+        grp_ob = QGroupBox("🟦  Order Blocks (OB)")
+        ov = QVBoxLayout(grp_ob); ov.setSpacing(6)
+
+        self.chk_ob = QCheckBox("Enable OB detection")
+        self.chk_ob.setChecked(True)
+        self.chk_ob.setToolTip(
+            "Scan candles for Order Block patterns\n"
+            "Classic: last opposite candle before strong impulse\n"
+            "BOS-based: candle that caused structure break\n"
+            "Aqua = Bullish OB  |  Magenta = Bearish OB\n"
+            "Mitigated zones auto-removed from chart"
+        )
+        self.chk_ob.stateChanged.connect(self._on_ob_toggled)
+        ov.addWidget(self.chk_ob)
+
+        ob_imp_row = QHBoxLayout(); ob_imp_row.setSpacing(8)
+        lbl_imp = _lbl("📏 Min Impulse:")
+        lbl_imp.setFixedWidth(100)
+        lbl_imp.setToolTip(
+            "Minimum impulse to confirm an OB.\n"
+            "Both conditions required:\n"
+            "  1. Close beyond OB candle high/low\n"
+            "  2. Move ≥ this many pips from OB boundary\n"
+            "Recommended: 2-5 for M1, 5-15 for M15"
+        )
+        ob_imp_row.addWidget(lbl_imp)
+        self.spin_ob_impulse = QDoubleSpinBox()
+        self.spin_ob_impulse.setRange(0.5, 200.0)
+        self.spin_ob_impulse.setSingleStep(0.5)
+        self.spin_ob_impulse.setValue(3.0)
+        self.spin_ob_impulse.setDecimals(1)
+        self.spin_ob_impulse.setSuffix(" pips")
+        self.spin_ob_impulse.valueChanged.connect(self._on_ob_settings_changed)
+        ob_imp_row.addWidget(self.spin_ob_impulse)
+        ov.addLayout(ob_imp_row)
+
+        ob_lb_row = QHBoxLayout(); ob_lb_row.setSpacing(8)
+        lbl_ob_lb = _lbl("🕯 Lookback:")
+        lbl_ob_lb.setFixedWidth(100)
+        lbl_ob_lb.setToolTip("How many candles to scan for OB patterns")
+        ob_lb_row.addWidget(lbl_ob_lb)
+        self.spin_ob_lookback = QSpinBox()
+        self.spin_ob_lookback.setRange(10, 1000)
+        self.spin_ob_lookback.setSingleStep(50)
+        self.spin_ob_lookback.setValue(200)
+        self.spin_ob_lookback.valueChanged.connect(self._on_ob_settings_changed)
+        ob_lb_row.addWidget(self.spin_ob_lookback)
+        ov.addLayout(ob_lb_row)
+
+        ob_sw_row = QHBoxLayout(); ob_sw_row.setSpacing(8)
+        lbl_ob_sw = _lbl("📐 Swing Bars:")
+        lbl_ob_sw.setFixedWidth(100)
+        lbl_ob_sw.setToolTip(
+            "Bars each side to confirm a swing high/low.\n"
+            "Used by the BOS-based OB method only.\n"
+            "Higher = fewer, stronger swing points"
+        )
+        ob_sw_row.addWidget(lbl_ob_sw)
+        self.spin_ob_swing = QSpinBox()
+        self.spin_ob_swing.setRange(2, 20)
+        self.spin_ob_swing.setSingleStep(1)
+        self.spin_ob_swing.setValue(5)
+        self.spin_ob_swing.valueChanged.connect(self._on_ob_settings_changed)
+        ob_sw_row.addWidget(self.spin_ob_swing)
+        ov.addLayout(ob_sw_row)
+
+        ob_max_row = QHBoxLayout(); ob_max_row.setSpacing(8)
+        lbl_ob_max = _lbl("🔲 Max Rects:")
+        lbl_ob_max.setFixedWidth(100)
+        lbl_ob_max.setToolTip("Maximum OB rectangles drawn on chart (newest first)")
+        ob_max_row.addWidget(lbl_ob_max)
+        self.spin_ob_max = QSpinBox()
+        self.spin_ob_max.setRange(1, 200)
+        self.spin_ob_max.setSingleStep(5)
+        self.spin_ob_max.setValue(20)
+        self.spin_ob_max.valueChanged.connect(self._on_ob_settings_changed)
+        ob_max_row.addWidget(self.spin_ob_max)
+        ov.addLayout(ob_max_row)
+
+        self.lbl_ob_count = QLabel("OBs: —")
+        self.lbl_ob_count.setStyleSheet(
+            f"color:{C['aqua']};font-family:Consolas;font-size:10px;")
+        ov.addWidget(self.lbl_ob_count)
+
+        vl.addWidget(grp_ob)
+
+        # ── Confluence Settings ───────────────────────────────────
+        grp_conf = QGroupBox("🟡  OB + FVG Confluence")
+        grp_conf.setStyleSheet(
+            f"QGroupBox {{ background:{C['card']};border:1px solid {C['yellow']};"
+            f"border-radius:6px;margin-top:14px;padding:8px 6px 6px 6px;"
+            f"font-size:10px;font-weight:bold;color:{C['yellow']}; }}"
+            f"QGroupBox::title {{ subcontrol-origin:margin;left:10px;padding:0 4px; }}"
+        )
+        cv = QVBoxLayout(grp_conf); cv.setSpacing(6)
+
+        self.chk_confluence = QCheckBox("Enable OB+FVG Confluence mode")
+        self.chk_confluence.setChecked(False)
+        self.chk_confluence.setStyleSheet(f"color:{C['yellow']};font-weight:bold;")
+        self.chk_confluence.setToolTip(
+            "Show only Order Blocks that have a Fair Value Gap\n"
+            "appearing right after them — highest confluence zones.\n\n"
+            "When ON:\n"
+            "  • Individual OB and FVG rectangles are hidden\n"
+            "  • Only combined confluence zones are drawn\n"
+            "  • Gold outline = Bullish confluence\n"
+            "  • Purple outline = Bearish confluence\n\n"
+            "Requires both OB and FVG detection to be enabled."
+        )
+        self.chk_confluence.stateChanged.connect(self._on_confluence_toggled)
+        cv.addWidget(self.chk_confluence)
+
+        conf_win_row = QHBoxLayout(); conf_win_row.setSpacing(8)
+        lbl_conf_win = _lbl("🕯 FVG Window:")
+        lbl_conf_win.setFixedWidth(100)
+        lbl_conf_win.setToolTip(
+            "Max candles after the OB candle for an FVG to count as confluence.\n"
+            "Smaller = stricter (FVG must be right after OB)\n"
+            "Larger  = looser  (FVG can be further away)\n"
+            "Recommended: 5-15 for M1"
+        )
+        conf_win_row.addWidget(lbl_conf_win)
+        self.spin_conf_window = QSpinBox()
+        self.spin_conf_window.setRange(1, 100)
+        self.spin_conf_window.setSingleStep(1)
+        self.spin_conf_window.setValue(10)
+        self.spin_conf_window.setSuffix(" bars")
+        self.spin_conf_window.valueChanged.connect(self._on_confluence_settings_changed)
+        conf_win_row.addWidget(self.spin_conf_window)
+        cv.addLayout(conf_win_row)
+
+        self.chk_conf_direction = QCheckBox("Match FVG direction to OB")
+        self.chk_conf_direction.setChecked(True)
+        self.chk_conf_direction.setToolTip(
+            "When enabled: Bullish OB must have Bullish FVG after it (and vice versa)\n"
+            "When disabled: any FVG after OB counts regardless of direction"
+        )
+        self.chk_conf_direction.stateChanged.connect(self._on_confluence_settings_changed)
+        cv.addWidget(self.chk_conf_direction)
+
+        conf_max_row = QHBoxLayout(); conf_max_row.setSpacing(8)
+        lbl_conf_max = _lbl("🔲 Max Rects:")
+        lbl_conf_max.setFixedWidth(100)
+        lbl_conf_max.setToolTip("Maximum confluence rectangles drawn on chart")
+        conf_max_row.addWidget(lbl_conf_max)
+        self.spin_conf_max = QSpinBox()
+        self.spin_conf_max.setRange(1, 100)
+        self.spin_conf_max.setSingleStep(5)
+        self.spin_conf_max.setValue(20)
+        self.spin_conf_max.valueChanged.connect(self._on_confluence_settings_changed)
+        conf_max_row.addWidget(self.spin_conf_max)
+        cv.addLayout(conf_max_row)
+
+        self.lbl_conf_count = QLabel("Confluence: —")
+        self.lbl_conf_count.setStyleSheet(
+            f"color:{C['yellow']};font-family:Consolas;font-size:10px;")
+        cv.addWidget(self.lbl_conf_count)
+
+        vl.addWidget(grp_conf)
 
         # ── Cancel All group ──────────────────────────────────────
         grp_cancel = QGroupBox("🛑  Emergency")
@@ -429,7 +597,6 @@ class GUI(QMainWindow):
         w = QWidget(); vl = QVBoxLayout(w)
         vl.setContentsMargins(6, 6, 6, 6); vl.setSpacing(6)
 
-        # Summary mini-cards row
         row = QHBoxLayout(); row.setSpacing(8)
         self._src_cards = {}
         for key, label, color in [
@@ -455,7 +622,6 @@ class GUI(QMainWindow):
             row.addWidget(f)
         vl.addLayout(row)
 
-        # Sources table
         self.src_table = QTableWidget(0, 6)
         self.src_table.setHorizontalHeaderLabels(
             ["Line Name", "Price", "State", "Round", "BUY Lot", "SELL Lot"])
@@ -472,7 +638,6 @@ class GUI(QMainWindow):
         w = QWidget(); vl = QVBoxLayout(w)
         vl.setContentsMargins(6, 6, 6, 6); vl.setSpacing(6)
 
-        # Summary mini-cards
         row = QHBoxLayout(); row.setSpacing(8)
         self._ord_cards = {}
         for key, label, color in [
@@ -497,7 +662,6 @@ class GUI(QMainWindow):
             row.addWidget(f)
         vl.addLayout(row)
 
-        # Pending orders table
         grp_pend = QGroupBox("🔵  Pending Orders")
         pv = QVBoxLayout(grp_pend); pv.setContentsMargins(4, 4, 4, 4)
         self.tbl_pending = QTableWidget(0, 6)
@@ -510,7 +674,6 @@ class GUI(QMainWindow):
         pv.addWidget(self.tbl_pending)
         vl.addWidget(grp_pend)
 
-        # Open positions table
         grp_pos = QGroupBox("🟢  Open Positions")
         posv = QVBoxLayout(grp_pos); posv.setContentsMargins(4, 4, 4, 4)
         self.tbl_positions = QTableWidget(0, 6)
@@ -554,10 +717,10 @@ class GUI(QMainWindow):
         follow = self.chk_follow.isChecked()
 
         import config as cfg
-        cfg.ORDER_DISTANCE_PIPS  = self.spin_dist.value()
-        cfg.LOT_SIZE             = lot
-        cfg.TP_RR_RATIO          = 0.0
-        cfg.BALANCE_TP_RATIO     = 1.0 + self.spin_balance_tp.value() / 100.0
+        cfg.ORDER_DISTANCE_PIPS = self.spin_dist.value()
+        cfg.LOT_SIZE            = lot
+        cfg.TP_RR_RATIO         = 0.0
+        cfg.BALANCE_TP_RATIO    = 1.0 + self.spin_balance_tp.value() / 100.0
 
         self.lbl_sym_hdr.setText(sym)
 
@@ -571,6 +734,8 @@ class GUI(QMainWindow):
         self._worker.sig.on_status( lambda s:    self._sig.status.emit(s))
         self._worker.sig.on_state(  lambda s:    self._sig.state.emit(s))
         self._worker.sig.on_candle( lambda c:    self._sig.candle.emit(c))
+        # ← NEW: wire balance TP signal so GUI can stop all watchers cleanly
+        self._worker.sig.on_stop(   lambda:      self._sig.balance_tp.emit())
         self._worker.start()
 
         self.btn_start.setEnabled(False)
@@ -580,25 +745,115 @@ class GUI(QMainWindow):
         # Start FVG watcher if enabled
         if self.chk_fvg.isChecked():
             self._fvg_worker = FVGWatcher(
-                symbol       = sym,
-                min_gap_pips = self.spin_fvg_gap.value(),
-                lookback     = self.spin_fvg_lookback.value(),
-                max_draw     = self.spin_fvg_max.value(),
-                scan_interval= 5.0,
-                log_fn       = lambda m, l="INFO": self._sig.log_line.emit(m, l),
+                symbol        = sym,
+                min_gap_pips  = self.spin_fvg_gap.value(),
+                lookback      = self.spin_fvg_lookback.value(),
+                max_draw      = self.spin_fvg_max.value(),
+                scan_interval = 5.0,
+                log_fn        = lambda m, l="INFO": self._sig.log_line.emit(m, l),
             )
             self._fvg_worker.start()
 
+        # Start OB watcher if enabled
+        if self.chk_ob.isChecked():
+            self._ob_worker = OBWatcher(
+                symbol           = sym,
+                min_impulse_pips = self.spin_ob_impulse.value(),
+                lookback         = self.spin_ob_lookback.value(),
+                swing_lookback   = self.spin_ob_swing.value(),
+                max_draw         = self.spin_ob_max.value(),
+                scan_interval    = 5.0,
+                log_fn           = lambda m, l="INFO": self._sig.log_line.emit(m, l),
+            )
+            self._ob_worker.start()
+
+        # Start Confluence watcher if enabled (requires both OB and FVG)
+        if self.chk_confluence.isChecked():
+            if self._ob_worker and self._fvg_worker:
+                self._start_confluence(sym)
+            else:
+                self.chk_confluence.blockSignals(True)
+                self.chk_confluence.setChecked(False)
+                self.chk_confluence.blockSignals(False)
+                self._on_log(
+                    f"{datetime.now().strftime('%H:%M:%S')}  "
+                    f"⚠️  Confluence disabled: enable OB and FVG first, then check Confluence",
+                    "WARN"
+                )
+
     def _stop(self):
+        """Stop all watchers cleanly in the correct order."""
+        # Confluence first (re-enables OB/FVG draw_on_chart)
+        self._stop_confluence()
+        # FVG and OB before MT5 shutdown
         if self._fvg_worker:
             self._fvg_worker.stop()
             self._fvg_worker = None
+        if self._ob_worker:
+            self._ob_worker.stop()
+            self._ob_worker  = None
+        # Main watcher last — calls mt5.shutdown() at end of its run()
         if self._worker:
             self._worker.stop()
             self._worker = None
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self._on_status("⚫  Stopped")
+
+    # ← NEW: called on Qt main thread when balance TP fires
+    def _on_balance_tp_reached(self):
+        """Stop all watchers cleanly after balance TP. Called on Qt main thread."""
+        self._on_log(
+            f"{datetime.now().strftime('%H:%M:%S')}  "
+            f"🎯  Balance TP reached — stopping all watchers", "NEW"
+        )
+        # Stop in correct order: confluence → FVG/OB → watcher exits naturally
+        self._stop_confluence()
+        if self._fvg_worker:
+            self._fvg_worker.stop()
+            self._fvg_worker = None
+        if self._ob_worker:
+            self._ob_worker.stop()
+            self._ob_worker  = None
+        # Don't call _worker.stop() — it already set its own stop event.
+        # Just clear the reference; mt5.shutdown() runs at end of watcher.run().
+        self._worker = None
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self._on_status("🎯  Balance TP — session complete")
+
+    def _start_confluence(self, sym: str = None):
+        if sym is None:
+            sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        if not self._ob_worker or not self._fvg_worker:
+            self._on_log(
+                f"{datetime.now().strftime('%H:%M:%S')}  "
+                f"⚠️  Confluence needs both OB and FVG enabled — "
+                f"enable them first, then activate Confluence", "WARN"
+            )
+            self.chk_confluence.blockSignals(True)
+            self.chk_confluence.setChecked(False)
+            self.chk_confluence.blockSignals(False)
+            return
+        if self._confluence_worker:
+            return
+
+        self._confluence_worker = ConfluenceWatcher(
+            symbol            = sym,
+            ob_watcher        = self._ob_worker,
+            fvg_watcher       = self._fvg_worker,
+            max_candles_after = self.spin_conf_window.value(),
+            require_direction = self.chk_conf_direction.isChecked(),
+            scan_interval     = 5.0,
+            max_draw          = self.spin_conf_max.value(),
+            log_fn            = lambda m, l="INFO": self._sig.log_line.emit(m, l),
+        )
+        self._confluence_worker.start()
+
+    def _stop_confluence(self):
+        if self._confluence_worker:
+            self._confluence_worker.stop()
+            self._confluence_worker = None
 
     def _cancel_all(self):
         sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
@@ -614,6 +869,81 @@ class GUI(QMainWindow):
             self._on_log(f"{ts}  🗑️  Cancelled {cancelled} bot orders", "WARN")
         except Exception as e:
             self._on_log(f"Cancel error: {e}", "ERROR")
+
+    # ── Toggle Handlers (live enable/disable) ─────────────────────
+
+    def _on_fvg_toggled(self, state):
+        if not self._worker:
+            return
+        sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        if state == Qt.Checked:
+            if not self._fvg_worker:
+                self._fvg_worker = FVGWatcher(
+                    symbol        = sym,
+                    min_gap_pips  = self.spin_fvg_gap.value(),
+                    lookback      = self.spin_fvg_lookback.value(),
+                    max_draw      = self.spin_fvg_max.value(),
+                    scan_interval = 5.0,
+                    log_fn        = lambda m, l="INFO": self._sig.log_line.emit(m, l),
+                )
+                self._fvg_worker.start()
+        else:
+            if self._confluence_worker:
+                self._stop_confluence()
+                self.chk_confluence.blockSignals(True)
+                self.chk_confluence.setChecked(False)
+                self.chk_confluence.blockSignals(False)
+                self.lbl_conf_count.setText("Confluence: — (FVG disabled)")
+            if self._fvg_worker:
+                self._fvg_worker.stop()
+                self._fvg_worker = None
+            self.lbl_fvg_count.setText("FVGs: — (disabled)")
+
+    def _on_ob_toggled(self, state):
+        if not self._worker:
+            return
+        sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        if state == Qt.Checked:
+            if not self._ob_worker:
+                self._ob_worker = OBWatcher(
+                    symbol           = sym,
+                    min_impulse_pips = self.spin_ob_impulse.value(),
+                    lookback         = self.spin_ob_lookback.value(),
+                    swing_lookback   = self.spin_ob_swing.value(),
+                    max_draw         = self.spin_ob_max.value(),
+                    scan_interval    = 5.0,
+                    log_fn           = lambda m, l="INFO": self._sig.log_line.emit(m, l),
+                )
+                self._ob_worker.start()
+        else:
+            if self._confluence_worker:
+                self._stop_confluence()
+                self.chk_confluence.blockSignals(True)
+                self.chk_confluence.setChecked(False)
+                self.chk_confluence.blockSignals(False)
+                self.lbl_conf_count.setText("Confluence: — (OB disabled)")
+            if self._ob_worker:
+                self._ob_worker.stop()
+                self._ob_worker = None
+            self.lbl_ob_count.setText("OBs: — (disabled)")
+
+    def _on_confluence_toggled(self, state):
+        if not self._worker:
+            return
+        if state == Qt.Checked:
+            if not self._ob_worker or not self._fvg_worker:
+                self._on_log(
+                    f"{datetime.now().strftime('%H:%M:%S')}  "
+                    f"⚠️  Enable OB and FVG first, then activate Confluence", "WARN"
+                )
+                self.chk_confluence.blockSignals(True)
+                self.chk_confluence.setChecked(False)
+                self.chk_confluence.blockSignals(False)
+                return
+            self._start_confluence()
+        else:
+            self._stop_confluence()
+            self.lbl_conf_count.setText("Confluence: — (disabled)")
 
     # ── Signal Handlers ───────────────────────────────────────────
 
@@ -643,10 +973,8 @@ class GUI(QMainWindow):
         self.src_table.setRowCount(len(states))
         active_lines = []
         for r, s in enumerate(states):
-            st  = s["state"]
-            rnd = s["round"]
-            # direction field is now "B:0.02 S:0.04"
-            dir_str  = s.get("direction") or "—"
+            st       = s["state"]
+            rnd      = s["round"]
             buy_lot  = s.get("buy_lot",  s.get("lot", 0.0))
             sell_lot = s.get("sell_lot", s.get("lot", 0.0))
 
@@ -703,7 +1031,6 @@ class GUI(QMainWindow):
     def _refresh_orders(self):
         sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
         try:
-            # Pending orders
             orders   = mt5.orders_get(symbol=sym) or []
             bot_ord  = [o for o in orders if o.magic == MAGIC_NUMBER]
             self.tbl_pending.setRowCount(len(bot_ord))
@@ -719,7 +1046,6 @@ class GUI(QMainWindow):
                     it = QTableWidgetItem(v); it.setForeground(clr)
                     self.tbl_pending.setItem(r, c, it)
 
-            # Open positions
             positions = mt5.positions_get(symbol=sym) or []
             bot_pos   = [p for p in positions if p.magic == MAGIC_NUMBER]
             self.tbl_positions.setRowCount(len(bot_pos))
@@ -748,13 +1074,10 @@ class GUI(QMainWindow):
             self._ord_cards["total_pnl"].setStyleSheet(
                 f"color:{pnl_color};font-size:15px;font-weight:bold;font-family:Consolas;")
 
-            # Update balance display
             acct = mt5.account_info()
             if acct:
-                # Load session start balance from file (same file watcher.py saves)
-                sym          = self.sym_combo.currentText().strip() or WATCH_SYMBOL
-                pct          = self.spin_balance_tp.value()
-                start_bal    = acct.balance  # fallback
+                pct       = self.spin_balance_tp.value()
+                start_bal = acct.balance
                 try:
                     import json as _json, os as _os
                     _f = f"start_balance_{sym}.json"
@@ -776,13 +1099,75 @@ class GUI(QMainWindow):
         except Exception:
             pass
 
+    def _refresh_indicator_counts(self):
+        """Update FVG, OB, and Confluence count labels."""
+        try:
+            if self._fvg_worker:
+                fvgs = self._fvg_worker.get_fvgs()
+                bull = sum(1 for f in fvgs if f.kind == "BULL")
+                bear = sum(1 for f in fvgs if f.kind == "BEAR")
+                self.lbl_fvg_count.setText(
+                    f"FVGs: {len(fvgs)} total  🟢{bull} bull  🔴{bear} bear")
+            elif not self.chk_fvg.isChecked():
+                self.lbl_fvg_count.setText("FVGs: — (disabled)")
+        except Exception:
+            pass
+
+        try:
+            if self._ob_worker:
+                active_obs = self._ob_worker.get_obs()
+                all_obs    = self._ob_worker.get_all_obs()
+                mitigated  = sum(1 for ob in all_obs if ob.mitigated)
+                bull       = sum(1 for ob in active_obs if ob.kind == "BULL")
+                bear       = sum(1 for ob in active_obs if ob.kind == "BEAR")
+                self.lbl_ob_count.setText(
+                    f"OBs: {len(active_obs)} active  "
+                    f"🟦{bull} bull  🟣{bear} bear  "
+                    f"({mitigated} mitigated)"
+                )
+            elif not self.chk_ob.isChecked():
+                self.lbl_ob_count.setText("OBs: — (disabled)")
+        except Exception:
+            pass
+
+        try:
+            if self._confluence_worker:
+                zones = self._confluence_worker.get_zones()
+                bull  = sum(1 for z in zones if z.kind == "BULL")
+                bear  = sum(1 for z in zones if z.kind == "BEAR")
+                self.lbl_conf_count.setText(
+                    f"Confluence: {len(zones)} zones  🟡{bull} bull  🟣{bear} bear"
+                )
+            elif not self.chk_confluence.isChecked():
+                self.lbl_conf_count.setText("Confluence: — (disabled)")
+        except Exception:
+            pass
+
+    # ── Settings change handlers ──────────────────────────────────
+
     def _on_fvg_settings_changed(self):
-        """Hot-update FVG watcher when spinboxes change."""
         if self._fvg_worker:
             self._fvg_worker.update_settings(
                 min_gap_pips = self.spin_fvg_gap.value(),
                 lookback     = self.spin_fvg_lookback.value(),
                 max_draw     = self.spin_fvg_max.value(),
+            )
+
+    def _on_ob_settings_changed(self):
+        if self._ob_worker:
+            self._ob_worker.update_settings(
+                min_impulse_pips = self.spin_ob_impulse.value(),
+                lookback         = self.spin_ob_lookback.value(),
+                swing_lookback   = self.spin_ob_swing.value(),
+                max_draw         = self.spin_ob_max.value(),
+            )
+
+    def _on_confluence_settings_changed(self):
+        if self._confluence_worker:
+            self._confluence_worker.update_settings(
+                max_candles_after = self.spin_conf_window.value(),
+                require_direction = self.chk_conf_direction.isChecked(),
+                max_draw          = self.spin_conf_max.value(),
             )
 
     def _on_symbol_changed(self, sym: str):
@@ -801,6 +1186,7 @@ class GUI(QMainWindow):
     def closeEvent(self, event):
         self._stop()
         event.accept()
+
 # ── Entry Point ───────────────────────────────────────────────────
 def main():
     app = QApplication(sys.argv)

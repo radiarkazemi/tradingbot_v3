@@ -1,0 +1,18 @@
+{
+  "name": "M1 Horizontal Line 53178",
+  "price": 4340.88,
+  "dist_pips": 15.0,
+  "pip_size": 0.1,
+  "base_lot": 0.01,
+  "round": 2,
+  "buy_lot": 0.04,
+  "sell_lot": 0.08,
+  "buy_ticket": 344347313,
+  "sell_ticket": 344342496,
+  "buy_pos_ticket": null,
+  "sell_pos_ticket": 344342496,
+  "buy_confirmed": false,
+  "sell_confirmed": true,
+  "state": "active",
+  "saved_at": 1781629239.6764524
+}

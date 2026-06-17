@@ -1,18 +1,18 @@
 {
-  "name": "M1 Horizontal Line 53178",
-  "price": 4340.88,
+  "name": "M5 Rectangle 56483",
+  "price": 4326.82,
   "dist_pips": 15.0,
   "pip_size": 0.1,
   "base_lot": 0.01,
-  "round": 2,
-  "buy_lot": 0.04,
-  "sell_lot": 0.08,
-  "buy_ticket": 344347313,
-  "sell_ticket": 344342496,
+  "round": 5,
+  "buy_lot": 0.64,
+  "sell_lot": 0.32,
+  "buy_ticket": 344482178,
+  "sell_ticket": 344482177,
   "buy_pos_ticket": null,
-  "sell_pos_ticket": 344342496,
+  "sell_pos_ticket": null,
   "buy_confirmed": false,
-  "sell_confirmed": true,
+  "sell_confirmed": false,
   "state": "active",
-  "saved_at": 1781629239.6764524
+  "saved_at": 1781683315.094626
 }

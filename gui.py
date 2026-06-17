@@ -36,6 +36,8 @@ from core.position_monitor import SourceState
 from core.fvg_watcher import FVGWatcher
 from core.ob_watcher import OBWatcher
 from core.confluence_watcher import ConfluenceWatcher
+from core.amd_watcher import AMDWatcher, ALL_LEVELS, DEFAULT_LEVELS
+from core.mtf_fvg_watcher import MTFFVGWatcher
 
 # ── Palette ───────────────────────────────────────────────────────
 C = {
@@ -60,6 +62,9 @@ C = {
     "aqua":     "#00FFFF",
     "magenta":  "#FF00FF",
     "yellow":   "#FFD700",
+    "amd_a":    "#00C853",
+    "amd_m":    "#FF1744",
+    "amd_d":    "#2979FF",
 }
 
 SS = f"""
@@ -146,6 +151,8 @@ class GUI(QMainWindow):
         self._fvg_worker:        Optional[FVGWatcher]        = None
         self._ob_worker:         Optional[OBWatcher]         = None
         self._confluence_worker: Optional[ConfluenceWatcher] = None
+        self._amd_worker:        Optional[AMDWatcher]         = None
+        self._mtf_fvg_worker:    Optional[MTFFVGWatcher]      = None
 
         self._sig = Sig()
         self._sig.log_line.connect(self._on_log)
@@ -175,6 +182,11 @@ class GUI(QMainWindow):
         self._ct.start(5000)
 
         QTimer.singleShot(200, self._init_price)
+
+        # AMD status refresh
+        self._at = QTimer()
+        self._at.timeout.connect(self._refresh_amd_status)
+        self._at.start(10000)
 
     # ── UI Build ──────────────────────────────────────────────────
 
@@ -565,6 +577,151 @@ class GUI(QMainWindow):
         ecl.addWidget(self.btn_cancel_all)
         vl.addWidget(grp_cancel)
 
+
+
+        # ── MTF FVG Confluence ────────────────────────────────────
+        grp_mtf = QGroupBox("🟡  MTF FVG Confluence (15M+5M+1M)")
+        grp_mtf.setStyleSheet(
+            f"QGroupBox {{ background:{C['card']};border:1px solid {C['gold']};"
+            f"border-radius:6px;margin-top:14px;padding:8px 6px 6px 6px;"
+            f"font-size:10px;font-weight:bold;color:{C['gold']}; }}"
+            f"QGroupBox::title {{ subcontrol-origin:margin;left:10px;padding:0 4px; }}"
+        )
+        mv = QVBoxLayout(grp_mtf); mv.setSpacing(6)
+
+        self.chk_mtf = QCheckBox("Enable MTF FVG detection")
+        self.chk_mtf.setChecked(False)
+        self.chk_mtf.setToolTip(
+            "Finds price zones where 15M + 5M + 1M FVGs all overlap\n"
+            "in the same direction simultaneously.\n\n"
+            "Triggered on every completed 1M candle.\n"
+            "🟡 Gold box = Bullish confluence entry zone\n"
+            "🟣 Purple box = Bearish confluence entry zone\n"
+            "Zones auto-removed when price enters them."
+        )
+        self.chk_mtf.stateChanged.connect(self._on_mtf_toggled)
+        mv.addWidget(self.chk_mtf)
+
+        mtf_gap_row = QHBoxLayout(); mtf_gap_row.setSpacing(8)
+        lbl_mtf_gap = _lbl("📏 Min Gap (pips):"); lbl_mtf_gap.setFixedWidth(100)
+        mtf_gap_row.addWidget(lbl_mtf_gap)
+        self.spin_mtf_gap = QDoubleSpinBox()
+        self.spin_mtf_gap.setRange(0.1, 50.0); self.spin_mtf_gap.setSingleStep(0.1)
+        self.spin_mtf_gap.setValue(1.0); self.spin_mtf_gap.setDecimals(1)
+        self.spin_mtf_gap.setSuffix(" pips")
+        self.spin_mtf_gap.setToolTip("Minimum FVG size on each timeframe to qualify")
+        self.spin_mtf_gap.valueChanged.connect(self._on_mtf_settings_changed)
+        mtf_gap_row.addWidget(self.spin_mtf_gap)
+        mv.addLayout(mtf_gap_row)
+
+        mtf_lb15_row = QHBoxLayout(); mtf_lb15_row.setSpacing(8)
+        lbl_mtf_lb15 = _lbl("🕯 15M Lookback:"); lbl_mtf_lb15.setFixedWidth(100)
+        mtf_lb15_row.addWidget(lbl_mtf_lb15)
+        self.spin_mtf_lb15 = QSpinBox()
+        self.spin_mtf_lb15.setRange(10, 200); self.spin_mtf_lb15.setSingleStep(10)
+        self.spin_mtf_lb15.setValue(50)
+        self.spin_mtf_lb15.valueChanged.connect(self._on_mtf_settings_changed)
+        mtf_lb15_row.addWidget(self.spin_mtf_lb15)
+        mv.addLayout(mtf_lb15_row)
+
+        mtf_lb5_row = QHBoxLayout(); mtf_lb5_row.setSpacing(8)
+        lbl_mtf_lb5 = _lbl("🕯 5M Lookback:"); lbl_mtf_lb5.setFixedWidth(100)
+        mtf_lb5_row.addWidget(lbl_mtf_lb5)
+        self.spin_mtf_lb5 = QSpinBox()
+        self.spin_mtf_lb5.setRange(10, 500); self.spin_mtf_lb5.setSingleStep(20)
+        self.spin_mtf_lb5.setValue(100)
+        self.spin_mtf_lb5.valueChanged.connect(self._on_mtf_settings_changed)
+        mtf_lb5_row.addWidget(self.spin_mtf_lb5)
+        mv.addLayout(mtf_lb5_row)
+
+        mtf_lb1_row = QHBoxLayout(); mtf_lb1_row.setSpacing(8)
+        lbl_mtf_lb1 = _lbl("🕯 1M Lookback:"); lbl_mtf_lb1.setFixedWidth(100)
+        mtf_lb1_row.addWidget(lbl_mtf_lb1)
+        self.spin_mtf_lb1 = QSpinBox()
+        self.spin_mtf_lb1.setRange(10, 1000); self.spin_mtf_lb1.setSingleStep(50)
+        self.spin_mtf_lb1.setValue(200)
+        self.spin_mtf_lb1.valueChanged.connect(self._on_mtf_settings_changed)
+        mtf_lb1_row.addWidget(self.spin_mtf_lb1)
+        mv.addLayout(mtf_lb1_row)
+
+        mtf_max_row = QHBoxLayout(); mtf_max_row.setSpacing(8)
+        lbl_mtf_max = _lbl("🔲 Max Zones:"); lbl_mtf_max.setFixedWidth(100)
+        mtf_max_row.addWidget(lbl_mtf_max)
+        self.spin_mtf_max = QSpinBox()
+        self.spin_mtf_max.setRange(1, 50); self.spin_mtf_max.setSingleStep(5)
+        self.spin_mtf_max.setValue(20)
+        self.spin_mtf_max.valueChanged.connect(self._on_mtf_settings_changed)
+        mtf_max_row.addWidget(self.spin_mtf_max)
+        mv.addLayout(mtf_max_row)
+
+        self.lbl_mtf_count = QLabel("MTF FVG: —")
+        self.lbl_mtf_count.setStyleSheet(
+            f"color:{C['gold']};font-family:Consolas;font-size:10px;")
+        mv.addWidget(self.lbl_mtf_count)
+
+        vl.addWidget(grp_mtf)
+
+        # ── AMD Quarter Theory ────────────────────────────────────
+        grp_amd = QGroupBox("🟩  AMD Quarter Theory")
+        grp_amd.setStyleSheet(
+            f"QGroupBox {{ background:{C['card']};border:1px solid {C['amd_a']};"
+            f"border-radius:6px;margin-top:14px;padding:8px 6px 6px 6px;"
+            f"font-size:10px;font-weight:bold;color:{C['amd_a']}; }}"
+            f"QGroupBox::title {{ subcontrol-origin:margin;left:10px;padding:0 4px; }}"
+        )
+        av = QVBoxLayout(grp_amd); av.setSpacing(6)
+
+        self.chk_amd = QCheckBox("Enable AMD detection")
+        self.chk_amd.setChecked(False)
+        self.chk_amd.setToolTip(
+            "Quarter Theory AMD phases on chart\n"
+            "🟩 A = Accumulation  🟥 M = Manipulation  🟦 D = Distribution\n\n"
+            "Boxes drawn for each level. Info table top-right of chart.\n"
+            "Year → Quarter → Month → Week → Day → 4H → 1H → 5M → 1M"
+        )
+        self.chk_amd.stateChanged.connect(self._on_amd_toggled)
+        av.addWidget(self.chk_amd)
+
+        # Show all phases or current only
+        self.chk_amd_all = QCheckBox("Show all phases (not just current)")
+        self.chk_amd_all.setChecked(False)
+        self.chk_amd_all.setToolTip(
+            "When ON: draws all A/M/D/C boxes for the full period\n"
+            "When OFF: draws only the currently active phase box per level"
+        )
+        self.chk_amd_all.stateChanged.connect(self._on_amd_settings_changed)
+        av.addWidget(self.chk_amd_all)
+
+        # Level checkboxes
+        av.addWidget(_lbl("📊 Visible levels:"))
+        self._amd_level_checks = {}
+        level_colors = {
+            "1M":      C['txt3'],
+            "5M":      C['txt2'],
+            "1H":      C['cyan'],
+            "4H":      C['blue'],
+            "Day":     C['gold'],
+            "Week":    C['orange'],
+            "Month":   C['amd_m'],
+            "Quarter": C['purple'],
+        }
+        for level in ["1M","5M","1H","4H","Day","Week","Month","Quarter"]:
+            chk = QCheckBox(level)
+            chk.setChecked(level in DEFAULT_LEVELS)
+            chk.setStyleSheet(f"color:{level_colors.get(level, C['txt2'])};")
+            chk.stateChanged.connect(self._on_amd_settings_changed)
+            self._amd_level_checks[level] = chk
+            av.addWidget(chk)
+
+        # AMD status display
+        self.lbl_amd_status = QLabel("AMD: —")
+        self.lbl_amd_status.setStyleSheet(
+            f"color:{C['amd_a']};font-family:Consolas;font-size:10px;")
+        self.lbl_amd_status.setWordWrap(True)
+        av.addWidget(self.lbl_amd_status)
+
+        vl.addWidget(grp_amd)
+
         vl.addStretch()
         return scroll
 
@@ -767,6 +924,14 @@ class GUI(QMainWindow):
             )
             self._ob_worker.start()
 
+        # Start MTF FVG watcher if enabled
+        if self.chk_mtf.isChecked():
+            self._start_mtf(sym)
+
+        # Start AMD watcher if enabled
+        if self.chk_amd.isChecked():
+            self._start_amd(sym)
+
         # Start Confluence watcher if enabled (requires both OB and FVG)
         if self.chk_confluence.isChecked():
             if self._ob_worker and self._fvg_worker:
@@ -785,6 +950,12 @@ class GUI(QMainWindow):
         """Stop all watchers cleanly in the correct order."""
         # Confluence first (re-enables OB/FVG draw_on_chart)
         self._stop_confluence()
+        if self._amd_worker:
+            self._amd_worker.stop()
+            self._amd_worker = None
+        if self._mtf_fvg_worker:
+            self._mtf_fvg_worker.stop()
+            self._mtf_fvg_worker = None
         # FVG and OB before MT5 shutdown
         if self._fvg_worker:
             self._fvg_worker.stop()
@@ -807,8 +978,17 @@ class GUI(QMainWindow):
             f"{datetime.now().strftime('%H:%M:%S')}  "
             f"🎯  Balance TP reached — stopping all watchers", "NEW"
         )
-        # Stop in correct order: confluence → FVG/OB → watcher exits naturally
+        # Stop in correct order: confluence → FVG/OB/AMD/MTF → watcher exits naturally
         self._stop_confluence()
+        if self._mtf_fvg_worker:
+            self._mtf_fvg_worker.stop()
+            self._mtf_fvg_worker = None
+        if self._amd_worker:
+            self._amd_worker.stop()
+            self._amd_worker = None
+        if self._mtf_fvg_worker:
+            self._mtf_fvg_worker.stop()
+            self._mtf_fvg_worker = None
         if self._fvg_worker:
             self._fvg_worker.stop()
             self._fvg_worker = None
@@ -1100,7 +1280,8 @@ class GUI(QMainWindow):
             pass
 
     def _refresh_indicator_counts(self):
-        """Update FVG, OB, and Confluence count labels."""
+        """Update FVG, OB, Confluence, MTF FVG, and AMD count labels."""
+        self._refresh_mtf_count()
         try:
             if self._fvg_worker:
                 fvgs = self._fvg_worker.get_fvgs()
@@ -1145,6 +1326,112 @@ class GUI(QMainWindow):
 
     # ── Settings change handlers ──────────────────────────────────
 
+
+    def _start_amd(self, sym: str = None):
+        if sym is None:
+            sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        if self._amd_worker:
+            return
+        levels = [lv for lv, chk in self._amd_level_checks.items() if chk.isChecked()]
+        self._amd_worker = AMDWatcher(
+            symbol          = sym,
+            visible_levels  = levels or DEFAULT_LEVELS,
+            show_all_phases = self.chk_amd_all.isChecked(),
+            scan_interval   = 10.0,
+            draw_on_chart   = True,
+            log_fn          = lambda m, l="INFO": self._sig.log_line.emit(m, l),
+        )
+        self._amd_worker.start()
+
+    def _on_amd_toggled(self, state):
+        if not self._worker:
+            return
+        sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        if state == Qt.Checked:
+            self._start_amd(sym)
+        else:
+            if self._amd_worker:
+                self._amd_worker.stop()
+                self._amd_worker = None
+            self.lbl_amd_status.setText("AMD: — (disabled)")
+
+    def _on_amd_settings_changed(self):
+        if self._amd_worker:
+            levels = [lv for lv, chk in self._amd_level_checks.items() if chk.isChecked()]
+            self._amd_worker.update_settings(
+                visible_levels  = levels or DEFAULT_LEVELS,
+                show_all_phases = self.chk_amd_all.isChecked(),
+            )
+
+    def _refresh_amd_status(self):
+        """Update AMD status label from live watcher."""
+        try:
+            if self._amd_worker:
+                s = self._amd_worker.get_status()
+                if s:
+                    def ic(label):
+                        if "(" in label and ")" in label:
+                            ph = label[label.index("(")+1:label.index(")")]
+                            return {"A":"🟩","M":"🟥","D":"🟦","C":"⬜"}.get(ph,"⬜")
+                        return "⬜"
+                    self.lbl_amd_status.setText(
+                        f"Y:{s.year}  {ic(s.quarter)}{s.quarter}  "
+                        f"{ic(s.month)}{s.month}  {ic(s.week)}{s.week}\n"
+                        f"{ic(s.day)}{s.day}  4H:{ic(s.h4)}{s.h4}  "
+                        f"1H:{ic(s.h1)}{s.h1}\n"
+                        f"5M:{ic(s.m5)}{s.m5}  1M:{ic(s.minute)}{s.minute}"
+                    )
+            elif not self.chk_amd.isChecked():
+                self.lbl_amd_status.setText("AMD: — (disabled)")
+        except Exception:
+            pass
+
+    def _start_mtf(self, sym=None):
+        if sym is None:
+            sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        if self._mtf_fvg_worker:
+            return
+        from core.order_manager import get_pip_size
+        import config as cfg
+        pip = get_pip_size(sym)
+        self._mtf_fvg_worker = MTFFVGWatcher(
+            symbol        = sym,
+            pip_size      = pip,
+            min_gap_pips  = self.spin_mtf_gap.value(),
+            lookback_15m  = self.spin_mtf_lb15.value(),
+            lookback_5m   = self.spin_mtf_lb5.value(),
+            lookback_1m   = self.spin_mtf_lb1.value(),
+            max_zones     = self.spin_mtf_max.value(),
+            max_draw      = self.spin_mtf_max.value(),
+            draw_on_chart = True,
+            poll_interval = 1.0,
+            log_fn        = lambda m, l="INFO": self._sig.log_line.emit(m, l),
+        )
+        self._mtf_fvg_worker.start()
+
+    def _on_mtf_toggled(self, state):
+        if not self._worker:
+            return
+        sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
+        if state == Qt.Checked:
+            self._start_mtf(sym)
+        else:
+            if self._mtf_fvg_worker:
+                self._mtf_fvg_worker.stop()
+                self._mtf_fvg_worker = None
+            self.lbl_mtf_count.setText("MTF FVG: — (disabled)")
+
+    def _on_mtf_settings_changed(self):
+        if self._mtf_fvg_worker:
+            self._mtf_fvg_worker.update_settings(
+                min_gap_pips = self.spin_mtf_gap.value(),
+                lookback_15m = self.spin_mtf_lb15.value(),
+                lookback_5m  = self.spin_mtf_lb5.value(),
+                lookback_1m  = self.spin_mtf_lb1.value(),
+                max_zones    = self.spin_mtf_max.value(),
+                max_draw     = self.spin_mtf_max.value(),
+            )
+
     def _on_fvg_settings_changed(self):
         if self._fvg_worker:
             self._fvg_worker.update_settings(
@@ -1152,6 +1439,23 @@ class GUI(QMainWindow):
                 lookback     = self.spin_fvg_lookback.value(),
                 max_draw     = self.spin_fvg_max.value(),
             )
+
+    def _refresh_mtf_count(self):
+        try:
+            if self._mtf_fvg_worker:
+                zones = self._mtf_fvg_worker.get_zones()
+                all_z = self._mtf_fvg_worker.get_all_zones()
+                mit   = sum(1 for z in all_z if z.mitigated)
+                bull  = sum(1 for z in zones if z.kind == "BULL")
+                bear  = sum(1 for z in zones if z.kind == "BEAR")
+                self.lbl_mtf_count.setText(
+                    f"MTF FVG: {len(zones)} active  "
+                    f"🟡{bull} bull  🟣{bear} bear  ({mit} mitigated)"
+                )
+            elif not self.chk_mtf.isChecked():
+                self.lbl_mtf_count.setText("MTF FVG: — (disabled)")
+        except Exception:
+            pass
 
     def _on_ob_settings_changed(self):
         if self._ob_worker:

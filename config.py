@@ -31,12 +31,20 @@ TP_RR_RATIO     = 0.0           # no fixed pip TP — balance TP used instead
 MAGIC_NUMBER    = 998877        # unique ID so bot can identify its own orders
 
 # ── OBJECT FILTERING ─────────────────────────────────────────────
-# Prefixes of auto-drawn or indicator objects to ignore
+# Prefixes of auto-drawn or indicator objects to ignore.
+# CRITICAL: every prefix used by any detector/drawer in this bot
+# MUST be listed here, or the watcher will treat its own drawn
+# rectangles/labels as trader-drawn signal lines and start trading
+# on them automatically — including indicators that are meant to
+# be visual-only (like MTF FVG, AMD, OB, FVG, Confluence).
 AUTO_OBJECT_PREFIXES = [
     "PA_", "CT", "GB_", "TB2_", "autotrade",
-    "FVG_",    # FVG detector rectangles
-    "OB_",     # Order Block rectangles
-    "OBFVG_",  # OB+FVG Confluence rectangles
+    "FVG_",      # FVG detector rectangles
+    "OB_",       # Order Block rectangles
+    "OBFVG_",    # OB+FVG Confluence rectangles
+    "AMD_",      # AMD Quarter Theory boxes
+    "AMDT_",     # AMD info table labels
+    "MTFFVG_",   # Multi-timeframe FVG confluence zones
 ]
 
 BOT_LINE_PREFIX = "TB2_"        # prefix for bot-drawn lines

@@ -580,7 +580,7 @@ class GUI(QMainWindow):
 
 
         # ── MTF FVG Confluence ────────────────────────────────────
-        grp_mtf = QGroupBox("🟡  MTF FVG Confluence (15M+5M+1M)")
+        grp_mtf = QGroupBox("🟡  MTF FVG Confluence")
         grp_mtf.setStyleSheet(
             f"QGroupBox {{ background:{C['card']};border:1px solid {C['gold']};"
             f"border-radius:6px;margin-top:14px;padding:8px 6px 6px 6px;"
@@ -592,8 +592,8 @@ class GUI(QMainWindow):
         self.chk_mtf = QCheckBox("Enable MTF FVG detection")
         self.chk_mtf.setChecked(False)
         self.chk_mtf.setToolTip(
-            "Finds price zones where 15M + 5M + 1M FVGs all overlap\n"
-            "in the same direction simultaneously.\n\n"
+            "Finds price zones where the selected timeframes' FVGs\n"
+            "all overlap in the same direction simultaneously.\n\n"
             "Triggered on every completed 1M candle.\n"
             "🟡 Gold box = Bullish confluence entry zone\n"
             "🟣 Purple box = Bearish confluence entry zone\n"
@@ -601,6 +601,33 @@ class GUI(QMainWindow):
         )
         self.chk_mtf.stateChanged.connect(self._on_mtf_toggled)
         mv.addWidget(self.chk_mtf)
+
+        # ── Timeframe selection ────────────────────────────────────
+        mv.addWidget(_lbl("📊 Timeframes to combine (pick 2 or 3):"))
+        mtf_tf_row = QHBoxLayout(); mtf_tf_row.setSpacing(10)
+        self.chk_mtf_15m = QCheckBox("15M")
+        self.chk_mtf_5m  = QCheckBox("5M")
+        self.chk_mtf_1m  = QCheckBox("1M")
+        for chk in (self.chk_mtf_15m, self.chk_mtf_5m, self.chk_mtf_1m):
+            chk.setChecked(True)
+            chk.stateChanged.connect(self._on_mtf_tf_selection_changed)
+            mtf_tf_row.addWidget(chk)
+        mv.addLayout(mtf_tf_row)
+
+        mtf_entry_row = QHBoxLayout(); mtf_entry_row.setSpacing(8)
+        lbl_mtf_entry = _lbl("🎯 Entry TF:"); lbl_mtf_entry.setFixedWidth(100)
+        lbl_mtf_entry.setToolTip(
+            "Which selected timeframe's FVG becomes the tradeable\n"
+            "zone — the box price must return into for an entry\n"
+            "to trigger. Doesn't have to be the smallest one."
+        )
+        mtf_entry_row.addWidget(lbl_mtf_entry)
+        self.combo_mtf_entry = QComboBox()
+        self.combo_mtf_entry.addItems(["15M", "5M", "1M"])
+        self.combo_mtf_entry.setCurrentText("1M")
+        self.combo_mtf_entry.currentTextChanged.connect(self._on_mtf_settings_changed)
+        mtf_entry_row.addWidget(self.combo_mtf_entry)
+        mv.addLayout(mtf_entry_row)
 
         mtf_gap_row = QHBoxLayout(); mtf_gap_row.setSpacing(8)
         lbl_mtf_gap = _lbl("📏 Min Gap (pips):"); lbl_mtf_gap.setFixedWidth(100)
@@ -1386,6 +1413,51 @@ class GUI(QMainWindow):
         except Exception:
             pass
 
+    def _get_selected_mtf_tfs(self) -> list:
+        """Currently checked timeframes, in largest-to-smallest order."""
+        order = []
+        if self.chk_mtf_15m.isChecked(): order.append("15M")
+        if self.chk_mtf_5m.isChecked():  order.append("5M")
+        if self.chk_mtf_1m.isChecked():  order.append("1M")
+        return order
+
+    def _on_mtf_tf_selection_changed(self):
+        """
+        Enforce a minimum of 2 selected timeframes (re-check the box
+        that was just unchecked if it would drop below 2), and keep
+        the entry-timeframe dropdown's options in sync with what's
+        actually selected.
+        """
+        boxes = {
+            "15M": self.chk_mtf_15m,
+            "5M":  self.chk_mtf_5m,
+            "1M":  self.chk_mtf_1m,
+        }
+        selected = self._get_selected_mtf_tfs()
+
+        if len(selected) < 2:
+            # Re-check whichever box the user just tried to uncheck —
+            # block signals to avoid a recursive triggering loop.
+            for tf, box in boxes.items():
+                if not box.isChecked():
+                    box.blockSignals(True)
+                    box.setChecked(True)
+                    box.blockSignals(False)
+            selected = self._get_selected_mtf_tfs()
+
+        # Keep entry-TF dropdown options matching the current selection
+        prev_entry = self.combo_mtf_entry.currentText()
+        self.combo_mtf_entry.blockSignals(True)
+        self.combo_mtf_entry.clear()
+        self.combo_mtf_entry.addItems(selected)
+        if prev_entry in selected:
+            self.combo_mtf_entry.setCurrentText(prev_entry)
+        else:
+            self.combo_mtf_entry.setCurrentText(selected[-1])  # default: smallest
+        self.combo_mtf_entry.blockSignals(False)
+
+        self._on_mtf_settings_changed()
+
     def _start_mtf(self, sym=None):
         if sym is None:
             sym = self.sym_combo.currentText().strip() or WATCH_SYMBOL
@@ -1397,6 +1469,8 @@ class GUI(QMainWindow):
         self._mtf_fvg_worker = MTFFVGWatcher(
             symbol        = sym,
             pip_size      = pip,
+            selected_tfs  = self._get_selected_mtf_tfs(),
+            entry_tf      = self.combo_mtf_entry.currentText(),
             min_gap_pips  = self.spin_mtf_gap.value(),
             lookback_15m  = self.spin_mtf_lb15.value(),
             lookback_5m   = self.spin_mtf_lb5.value(),
@@ -1424,6 +1498,8 @@ class GUI(QMainWindow):
     def _on_mtf_settings_changed(self):
         if self._mtf_fvg_worker:
             self._mtf_fvg_worker.update_settings(
+                selected_tfs = self._get_selected_mtf_tfs(),
+                entry_tf     = self.combo_mtf_entry.currentText(),
                 min_gap_pips = self.spin_mtf_gap.value(),
                 lookback_15m = self.spin_mtf_lb15.value(),
                 lookback_5m  = self.spin_mtf_lb5.value(),

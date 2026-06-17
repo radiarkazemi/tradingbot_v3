@@ -1,18 +1,18 @@
 {
-  "name": "M5 Rectangle 56483",
-  "price": 4326.82,
+  "name": "M1 Horizontal Line 27149",
+  "price": 4358.86,
   "dist_pips": 15.0,
   "pip_size": 0.1,
   "base_lot": 0.01,
   "round": 5,
   "buy_lot": 0.64,
   "sell_lot": 0.32,
-  "buy_ticket": 344482178,
-  "sell_ticket": 344482177,
-  "buy_pos_ticket": null,
+  "buy_ticket": 344660296,
+  "sell_ticket": 344666857,
+  "buy_pos_ticket": 344660296,
   "sell_pos_ticket": null,
-  "buy_confirmed": false,
+  "buy_confirmed": true,
   "sell_confirmed": false,
   "state": "active",
-  "saved_at": 1781683315.094626
+  "saved_at": 1781716226.37037
 }

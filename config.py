@@ -17,37 +17,31 @@ WATCH_SYMBOL = "EURUSD"
 SCAN_INTERVAL_SEC = 2
 
 # ── ORDER SETTINGS ───────────────────────────────────────────────
-# Distance above/below the main line where the buy-stop / sell-stop are placed
-ORDER_DISTANCE_PIPS = 1.5      # pips above line for BUY-STOP, below for SELL-STOP
+ORDER_DISTANCE_PIPS = 1.5
 
-# Stop-loss: mirrored across the main line
-# e.g. BUY-STOP entry = line + distance → SL = line - distance
-# SL is always the mirror of entry across the source line
+LOT_SIZE        = 0.01
+LOT_MULTIPLIER  = 1.20
 
-LOT_SIZE        = 0.01          # initial lot size
-LOT_MULTIPLIER  = 1.20          # kept for reference, not used in hedge mode
-
-TP_RR_RATIO     = 0.0           # no fixed pip TP — balance TP used instead
-MAGIC_NUMBER    = 998877        # unique ID so bot can identify its own orders
+TP_RR_RATIO     = 0.0
+MAGIC_NUMBER    = 998877
 
 # ── OBJECT FILTERING ─────────────────────────────────────────────
-# Prefixes of auto-drawn or indicator objects to ignore.
 # CRITICAL: every prefix used by any detector/drawer in this bot
 # MUST be listed here, or the watcher will treat its own drawn
 # rectangles/labels as trader-drawn signal lines and start trading
-# on them automatically — including indicators that are meant to
-# be visual-only (like MTF FVG, AMD, OB, FVG, Confluence).
+# on them automatically.
 AUTO_OBJECT_PREFIXES = [
     "PA_", "CT", "GB_", "TB2_", "autotrade",
-    "FVG_",      # FVG detector rectangles
-    "OB_",       # Order Block rectangles
-    "OBFVG_",    # OB+FVG Confluence rectangles
-    "AMD_",      # AMD Quarter Theory boxes
-    "AMDT_",     # AMD info table labels
-    "MTFFVG_",   # Multi-timeframe FVG confluence zones
+    "FVG_",       # FVG detector rectangles
+    "OB_",        # Order Block rectangles
+    "OBFVG_",     # OB+FVG Confluence rectangles
+    "AMD_",       # AMD Quarter Theory boxes
+    "AMDT_",      # AMD info table labels
+    "MTFFVG_",    # Multi-timeframe FVG confluence intersection zones
+    "MTFFVG5M_",  # Multi-timeframe FVG 5M entry rectangles (NEW)
 ]
 
-BOT_LINE_PREFIX = "TB2_"        # prefix for bot-drawn lines
+BOT_LINE_PREFIX = "TB2_"
 
 # ── LOGGING ──────────────────────────────────────────────────────
 LOG_LEVEL = "INFO"

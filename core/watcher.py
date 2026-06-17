@@ -419,6 +419,11 @@ class WatcherThread(threading.Thread):
                         )
                         state.registered_at = cur_t
                         state.last_prev_t   = prev_t
+                        # Seed tick price immediately so the first real
+                        # tick after registration can't be misread as a
+                        # "crossing" from an unset baseline.
+                        if tick:
+                            state._prev_tick_price = (tick.bid + tick.ask) / 2
                         self._sources[n]    = state
                         self._seen.add(n)
                         self.log(
@@ -470,36 +475,25 @@ class WatcherThread(threading.Thread):
                             state.dist_pips     = dist_pips
                             state.registered_at = cur_t
                             state.last_prev_t   = prev_t
+                            # Re-seed tick price at the new line level so the
+                            # moved line doesn't immediately register a false
+                            # "crossing" relative to its old price.
+                            if tick:
+                                state._prev_tick_price = (tick.bid + tick.ask) / 2
                             self._missing_counts.pop(n, None)
 
-                # ── Touch detection ───────────────────────────────
-                for n, state in self._sources.items():
-                    if state.state != SourceState.IDLE:
-                        continue
-
-                    src     = state.price
-                    reg     = state.registered_at
-                    touched = False
-                    desc    = ""
-
-                    if cur_h > 0 and cur_t != reg:
-                        if cur_l <= src <= cur_h:
-                            touched = True
-                            desc    = f"current candle C={cur_c:.5f}"
-
-                    if not touched and prev_h > 0:
-                        if prev_t > state.last_prev_t and prev_t > reg:
-                            state.last_prev_t = prev_t
-                            if prev_l <= src <= prev_h:
-                                touched = True
-                                desc    = f"prev candle C={prev_c:.5f}"
-
-                    if touched:
-                        self.log(
-                            f"🎯  [{n[:20]}] touched @ {src:.5f} ({desc}) | "
-                            f"dist={state.dist_pips}pips | placing orders", "NEW"
-                        )
-                        state.place_initial_pair()
+                # ── Touch detection (tick-based, timeframe-immune) ─
+                # Uses live bid/ask via SourceState.check_touch() instead
+                # of EA candle boundaries (CANDLE_T/PREV_T). This makes
+                # touch detection completely unaffected by the trader
+                # switching the MT5 chart's displayed timeframe, which
+                # previously caused duplicate order placement because
+                # the EA's reported candle times would jump to a
+                # different bar structure mid-session.
+                if tick:
+                    for n, state in self._sources.items():
+                        if state.state == SourceState.IDLE:
+                            state.check_touch(tick.bid, tick.ask)
 
                 # ── Monitor active/pending states ─────────────────
                 for n, state in list(self._sources.items()):

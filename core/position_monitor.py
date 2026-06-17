@@ -80,6 +80,15 @@ class SourceState:
         self.registered_at   = 0
         self.last_prev_t     = 0
 
+        # ── Tick-based touch detection (timeframe-immune) ─────────
+        # Switching the MT5 chart's timeframe view changes what the EA
+        # reports as CANDLE_T/PREV_T (different bar boundaries), which
+        # broke touch-detection dedup and caused duplicate order pairs.
+        # Touch detection now uses live tick price crossing instead of
+        # any EA candle field, so it is completely unaffected by the
+        # chart's displayed timeframe.
+        self._prev_tick_price = None   # last seen mid price, for crossing detection
+
     # ── Fixed price properties (never drift) ──────────────────────
     @property
     def _dist(self):
@@ -101,7 +110,70 @@ class SourceState:
     def _sell_sl_price(self):  # SL of SELL = BUY entry (exact mirror)
         return self._buy_entry
 
+    @property
+    def _buy_tp_price(self):
+        """Override in subclasses for a fixed TP. Base class: no TP (0.0)."""
+        return 0.0
+
+    @property
+    def _sell_tp_price(self):
+        """Override in subclasses for a fixed TP. Base class: no TP (0.0)."""
+        return 0.0
+
     # ── Public API ────────────────────────────────────────────────
+
+    def check_touch(self, bid: float, ask: float) -> bool:
+        """
+        Tick-based touch detection — timeframe-immune.
+
+        Returns True (and transitions to PENDING via place_initial_pair)
+        if price has touched self.price since the last tick we saw.
+
+        Detects a touch two ways:
+          1. Direct straddle: bid <= price <= ask right now
+          2. Crossing: the mid price moved from one side of self.price
+             to the other between the previous tick and this one
+             (catches fast moves where price jumps over the line
+             between two ticks without ever exactly straddling it)
+
+        This does not depend on any EA-reported candle data, so it
+        is unaffected by the user switching the MT5 chart's displayed
+        timeframe mid-session.
+        """
+        if self.state != self.IDLE:
+            return False
+        if bid <= 0 or ask <= 0:
+            return False
+
+        mid = (bid + ask) / 2
+        src = self.price
+
+        touched = False
+        desc    = ""
+
+        # Direct straddle this tick
+        if bid <= src <= ask:
+            touched = True
+            desc    = f"bid/ask straddle bid={bid:.5f} ask={ask:.5f}"
+
+        # Crossing since last tick
+        elif self._prev_tick_price is not None:
+            prev = self._prev_tick_price
+            if (prev < src <= mid) or (mid <= src < prev):
+                touched = True
+                desc    = f"crossed {prev:.5f}→{mid:.5f}"
+
+        self._prev_tick_price = mid
+
+        if touched:
+            self._log(
+                f"🎯  [{self.name[:20]}] touched @ {src:.5f} ({desc}) | "
+                f"dist={self.dist_pips}pips | placing orders", "NEW"
+            )
+            self.place_initial_pair()
+            return True
+
+        return False
 
     def place_initial_pair(self):
         self.round    = 1
@@ -110,9 +182,9 @@ class SourceState:
 
         orders = [
             {"type": "BUY_STOP",  "entry": self._buy_entry,  "sl": self._buy_sl_price,
-             "tp": 0.0, "lot": self.buy_lot,  "source": self.price, "round": 1},
+             "tp": self._buy_tp_price, "lot": self.buy_lot,  "source": self.price, "round": 1},
             {"type": "SELL_STOP", "entry": self._sell_entry, "sl": self._sell_sl_price,
-             "tp": 0.0, "lot": self.sell_lot, "source": self.price, "round": 1},
+             "tp": self._sell_tp_price, "lot": self.sell_lot, "source": self.price, "round": 1},
         ]
         results = send_pair(orders, self.symbol)
 
@@ -450,7 +522,7 @@ class SourceState:
             return
 
         order = {"type": "BUY_STOP", "entry": self._buy_entry,
-                 "sl": self._buy_sl_price, "tp": 0.0,
+                 "sl": self._buy_sl_price, "tp": self._buy_tp_price,
                  "lot": self.buy_lot, "source": self.price, "round": self.round}
         results = send_pair([order], self.symbol)
         ok = [r for r in results if r["ok"]]
@@ -480,7 +552,7 @@ class SourceState:
             return
 
         order = {"type": "SELL_STOP", "entry": self._sell_entry,
-                 "sl": self._sell_sl_price, "tp": 0.0,
+                 "sl": self._sell_sl_price, "tp": self._sell_tp_price,
                  "lot": self.sell_lot, "source": self.price, "round": self.round}
         results = send_pair([order], self.symbol)
         ok = [r for r in results if r["ok"]]
@@ -529,6 +601,7 @@ class SourceState:
 
         if already_past:
             market_price = ask if is_buy else bid
+            use_tp = self._buy_tp_price if is_buy else self._sell_tp_price
             request = {
                 "action":       mt5.TRADE_ACTION_DEAL,
                 "symbol":       self.symbol,
@@ -536,7 +609,7 @@ class SourceState:
                 "type":         mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL,
                 "price":        market_price,
                 "sl":           use_sl,
-                "tp":           0.0,
+                "tp":           use_tp,
                 "deviation":    30,
                 "magic":        MAGIC_NUMBER,
                 "comment":      (target.comment or "") + "m",
@@ -547,6 +620,7 @@ class SourceState:
                 f"MARKET lot={new_lot:.2f} sl={use_sl:.5f}", "WARN"
             )
         else:
+            use_tp = self._buy_tp_price if is_buy else self._sell_tp_price
             request = {
                 "action":       mt5.TRADE_ACTION_PENDING,
                 "symbol":       self.symbol,
@@ -554,7 +628,7 @@ class SourceState:
                 "type":         order_type,
                 "price":        entry,
                 "sl":           use_sl,
-                "tp":           0.0,
+                "tp":           use_tp,
                 "deviation":    20,
                 "magic":        MAGIC_NUMBER,
                 "comment":      (target.comment or "") + "m",

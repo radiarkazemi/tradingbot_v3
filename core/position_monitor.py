@@ -93,6 +93,17 @@ class SourceState:
         self.risk_free_applied = {"buy": False, "sell": False}
         self.needs_full_reset  = False   # watcher checks/clears this
 
+        # ── Auto-relocate (TP win / risk-free → fresh FVG) ──────────
+        # When _relocate_to_fresh_fvg() renames this instance to a
+        # synthetic key (so the watcher's chart-object move-detection
+        # never matches and reverts it), it stashes the new name here.
+        # watcher.py must read this once per cycle, re-key its
+        # self._sources dict entry (old name → new name), and clear
+        # this back to None — that re-keying can't happen from inside
+        # SourceState itself since it has no reference to that dict.
+        self.pending_rename     = None
+        self._is_auto_relocated = False
+
         # ── Tick-based touch detection (timeframe-immune) ─────────
         # Switching the MT5 chart's timeframe view changes what the EA
         # reports as CANDLE_T/PREV_T (different bar boundaries), which
@@ -125,63 +136,141 @@ class SourceState:
 
     def _reanchor_buy(self, close_price: float):
         """
-        Re-anchor self.price so _buy_entry recalculates to exactly
-        close_price (the real SL fill price of the just-closed BUY
-        position), eliminating slippage drift. Override in subclasses
-        that don't derive entry/SL from self.price directly (e.g.
-        FVGEntryState, which uses fvg_top/fvg_bottom instead).
+        No-op in the base class. self.price is the fixed main-line
+        anchor and must NEVER move — every new recovery order keeps
+        the same configured distance from it (set on the GUI), and
+        BUY/SELL SL mirroring (_buy_sl_price == _sell_entry and vice
+        versa) is already exact by construction since both sides
+        derive from this one shared, unmoving anchor. There is no
+        slippage gap to correct here: SL price and the opposite
+        side's entry price are literally the same computed value,
+        not two independently-sourced numbers that could drift apart.
+        (Earlier in this project's history this method moved
+        self.price to the real SL fill price — that broke things: it
+        shifted the shared anchor, which could land a brand-new
+        recovery order's ENTRY exactly on top of the opposite side's
+        already-open position. Kept as a hook only so subclasses with
+        genuinely independent edges, like FVGEntryState, can still
+        override it meaningfully.)
         """
-        self.price = close_price - self._dist
+        pass
 
     def _reanchor_sell(self, close_price: float):
-        """Re-anchor self.price so _sell_entry recalculates to exactly
-        close_price. See _reanchor_buy."""
-        self.price = close_price + self._dist
+        """No-op in the base class. See _reanchor_buy."""
+        pass
+
+    def _dollar_per_pip(self, lot: float) -> float:
+        """
+        Dollar profit (account currency) for exactly 1 pip of favorable
+        price movement at the given lot size, for this symbol. Uses
+        mt5.order_calc_profit() — the broker's own calculation engine
+        — so this is correct regardless of contract size, tick size/
+        value quirks, or profit-currency conversion, none of which
+        need to be reasoned about manually here.
+
+        Falls back to a manual tick-value-based calculation if
+        order_calc_profit is unavailable for some reason (e.g. a
+        symbol not currently selected/visible), and to 0.0 (caller
+        must guard against this) if neither path works.
+        """
+        try:
+            tick = mt5.symbol_info_tick(self.symbol)
+            if tick:
+                price = (tick.bid + tick.ask) / 2.0
+            else:
+                price = self.price
+            price_close = price + self.pip_size
+            profit = mt5.order_calc_profit(
+                mt5.ORDER_TYPE_BUY, self.symbol, lot, price, price_close
+            )
+            if profit is not None and profit > 0:
+                return float(profit)
+        except Exception as e:
+            log.warning("order_calc_profit failed for %s: %s", self.symbol, e)
+
+        # Fallback: manual tick-value calculation.
+        try:
+            info = mt5.symbol_info(self.symbol)
+            if info and info.trade_tick_size > 0:
+                pip_value_per_lot = (info.trade_tick_value
+                                    / info.trade_tick_size) * self.pip_size
+                return pip_value_per_lot * lot
+        except Exception as e:
+            log.warning("Tick-value pip calc failed for %s: %s", self.symbol, e)
+
+        return 0.0
 
     @property
-    def _dynamic_tp_pips(self) -> float:
+    def _balance_target_tp_pips(self) -> float:
         """
-        TP distance in pips, growing as the martingale lot grows.
+        TP distance in pips, sized so THIS position's TP closes the
+        remaining dollar gap to the GUI's balance-TP% goal (e.g. 10%
+        of starting balance) at the CURRENT lot size — recalculated
+        fresh every time this is read, so it naturally updates after
+        every lot-doubling (each martingale round) and after the SL
+        repositioning that happens elsewhere in this class.
 
-        base_tp_pips = dist_pips × 3  (same 1:3 RR convention used by
-        MTF FVG entries elsewhere in the bot)
+        gap = (start_balance × BALANCE_TP_RATIO) − current account
+        balance. tp_pips = gap / dollar_per_pip(current_lot). As lot
+        grows each round, the SAME dollar gap needs proportionally
+        LESS price movement to close — exactly mirroring the
+        intent behind the previous inverse-RR formula, but now tied
+        to the real GUI target instead of a fixed 1:3 multiple of
+        dist_pips.
 
-        Scales by the ratio of the CURRENT lot (whichever side is
-        about to be placed/modified — callers read this once per side)
-        to base_lot, so each time the lot doubles on a martingale round,
-        the TP distance grows proportionally. A round-1 0.01 lot trade
-        and a round-4 0.08 lot trade are not equally easy to recover
-        from at the same pip distance — the larger the lot, the more
-        room is given for the position to capture a real trending move
-        before locking in profit, rather than scalping a now much
-        bigger position for the same small price move.
+        Falls back to the fixed dist_pips × 3 convention if the
+        balance target isn't configured (start_balance <= 0) or the
+        dollar-per-pip lookup fails, so a TP is always produced.
         """
-        base_tp_pips = self.dist_pips * 3
-        if self.base_lot <= 0:
-            return base_tp_pips
-        # Use whichever lot is larger right now (covers the moment
-        # right after one side activates and the other side's lot has
-        # just been doubled, before both are equal again).
-        current_lot = max(self.buy_lot, self.sell_lot, self.base_lot)
-        ratio       = current_lot / self.base_lot
-        return base_tp_pips * ratio
+        fallback_pips = self.dist_pips * 3
+
+        if self.start_balance <= 0:
+            return fallback_pips
+
+        try:
+            import config as cfg
+            full_ratio = getattr(cfg, 'BALANCE_TP_RATIO', 1.10)
+            full_pct   = full_ratio - 1.0  # e.g. 0.10 for +10%
+
+            current_lot = max(self.buy_lot, self.sell_lot, self.base_lot)
+            if current_lot <= 0 or self.base_lot <= 0:
+                return fallback_pips
+
+            lot_ratio = current_lot / self.base_lot  # 1, 2, 4, 8 ...
+            pct = min(0.01 * lot_ratio, full_pct)
+
+            target_dollars = self.start_balance * pct
+            dollar_per_pip = self._dollar_per_pip(current_lot)
+            if dollar_per_pip <= 0:
+                return fallback_pips
+
+            tp_pips = target_dollars / dollar_per_pip
+
+            min_tp_pips = max(self.dist_pips * 0.2, 1.0)
+            max_tp_pips = self.dist_pips * 3  # never exceed 1:3 RR
+
+            return min(max(tp_pips, min_tp_pips), max_tp_pips)
+        except Exception as e:
+            log.warning("Balance-target TP calc error: %s", e)
+            return fallback_pips
 
     @property
     def _buy_tp_price(self):
         """
-        Dynamic TP that grows with lot size — see _dynamic_tp_pips.
-        Base class previously had no TP at all (0.0, let it run with
-        trend indefinitely); this keeps that "ride the trend" spirit
-        but gives a concrete, ever-widening target as the position
-        grows, rather than no target at all.
+        TP sized to close the remaining gap to the GUI's balance-TP%
+        target at the current lot size — see _balance_target_tp_pips.
+        Recalculated fresh every time this is read (every lot change/
+        SL touch reads this again via place_initial_pair / the modify-
+        lot path), so the TP line adjusts automatically each round.
         """
-        tp_dist = self._dynamic_tp_pips * self.pip_size
+        tp_dist = self._balance_target_tp_pips * self.pip_size
         return _round_price(self._buy_entry + tp_dist, self.symbol)
 
     @property
     def _sell_tp_price(self):
-        """Dynamic TP that grows with lot size — see _dynamic_tp_pips."""
-        tp_dist = self._dynamic_tp_pips * self.pip_size
+        """TP sized to close the remaining balance-target gap — see
+        _balance_target_tp_pips."""
+        tp_dist = self._balance_target_tp_pips * self.pip_size
         return _round_price(self._sell_entry - tp_dist, self.symbol)
 
     @property
@@ -539,6 +628,11 @@ class SourceState:
         if in_grace:
             return
 
+        # ── Keep each open position's TP synced to the balance-target
+        # gap as it shrinks/grows (lot changes, balance moves from a
+        # sibling line, etc.) — see _resync_open_tp.
+        self._resync_open_tp(buy_pos, sell_pos)
+
         # ── Risk-free: move SL to lock +1R once floating profit ≥2R ─
         self._check_risk_free(buy_pos, sell_pos)
 
@@ -554,11 +648,12 @@ class SourceState:
                 and self.buy_pos_ticket not in open_tickets
                 and self._buy_confirmed):
             closed_ticket = self.buy_pos_ticket
-            close_price   = self._get_close_price(closed_ticket)
+            close_price, close_reason = self._get_close_info(closed_ticket)
             was_risk_free = self.risk_free_applied.get("buy", False)
             self._log(
                 f"📉  [{self.name[:20]}] BUY pos#{closed_ticket} closed"
                 + (f" @ {close_price:.5f}" if close_price else "")
+                + (f" ({close_reason})" if close_reason else "")
                 + (" (was risk-free)" if was_risk_free else ""), "WARN"
             )
             self.buy_pos_ticket = None
@@ -574,6 +669,20 @@ class SourceState:
                 )
                 self.needs_full_reset = True
                 self.reset()
+                self._relocate_to_fresh_fvg()
+            elif close_reason == "tp":
+                # Round WON outright via take-profit — the martingale
+                # cycle is complete and successful. Do NOT chain into
+                # another recovery order at a bigger lot; that would
+                # treat a win exactly like a loss and risk a fresh
+                # loss eating into profit that's already locked in.
+                self._log(
+                    f"🏆  [{self.name[:20]}] BUY hit TP — round won, "
+                    f"resetting to IDLE, waiting for a fresh entry", "NEW"
+                )
+                self.needs_full_reset = True
+                self.reset()
+                self._relocate_to_fresh_fvg()
             else:
                 self._place_new_buy_stop(anchor_price=close_price)
 
@@ -581,11 +690,12 @@ class SourceState:
                 and self.sell_pos_ticket not in open_tickets
                 and self._sell_confirmed):
             closed_ticket = self.sell_pos_ticket
-            close_price   = self._get_close_price(closed_ticket)
+            close_price, close_reason = self._get_close_info(closed_ticket)
             was_risk_free = self.risk_free_applied.get("sell", False)
             self._log(
                 f"📉  [{self.name[:20]}] SELL pos#{closed_ticket} closed"
                 + (f" @ {close_price:.5f}" if close_price else "")
+                + (f" ({close_reason})" if close_reason else "")
                 + (" (was risk-free)" if was_risk_free else ""), "WARN"
             )
             self.sell_pos_ticket = None
@@ -597,8 +707,79 @@ class SourceState:
                 )
                 self.needs_full_reset = True
                 self.reset()
+                self._relocate_to_fresh_fvg()
+            elif close_reason == "tp":
+                self._log(
+                    f"🏆  [{self.name[:20]}] SELL hit TP — round won, "
+                    f"resetting to IDLE, waiting for a fresh entry", "NEW"
+                )
+                self.needs_full_reset = True
+                self.reset()
+                self._relocate_to_fresh_fvg()
             else:
                 self._place_new_sell_stop(anchor_price=close_price)
+
+    def _resync_open_tp(self, buy_pos: list, sell_pos: list):
+        """
+        Re-send TRADE_ACTION_SLTP for any open position whose live TP
+        no longer matches the freshly-computed balance-target TP (see
+        _balance_target_tp_pips). The gap to the GUI's balance-TP%
+        target shrinks every round as lot size grows, and can also
+        shift from balance changes elsewhere (a sibling line/round
+        winning or losing) — so a TP set once at entry time can go
+        stale. This keeps it live-adjusted on every poll while the
+        position is open.
+
+        Skipped for a side once risk-free has been applied to it —
+        at that point its SL/TP no longer represent the balance-
+        target goal, they represent the locked-in +1R profit level,
+        which _check_risk_free owns exclusively from then on.
+        """
+        if buy_pos and not self.risk_free_applied.get("buy", False):
+            pos = sorted(buy_pos, key=lambda p: p.time, reverse=True)[0]
+            target_tp = self._buy_tp_price
+            # Only bother re-sending if the change is more than a
+            # rounding/float-noise difference, to avoid spamming
+            # order_send every single scan for a no-op change.
+            if abs(pos.tp - target_tp) > self.pip_size * 0.05:
+                self._move_position_tp(pos.ticket, target_tp)
+
+        if sell_pos and not self.risk_free_applied.get("sell", False):
+            pos = sorted(sell_pos, key=lambda p: p.time, reverse=True)[0]
+            target_tp = self._sell_tp_price
+            if abs(pos.tp - target_tp) > self.pip_size * 0.05:
+                self._move_position_tp(pos.ticket, target_tp)
+
+    def _move_position_tp(self, ticket: int, new_tp: float) -> bool:
+        """Modify an open position's TP via TRADE_ACTION_SLTP, keeping
+        its current SL untouched."""
+        try:
+            pos = next((p for p in (mt5.positions_get(symbol=self.symbol) or [])
+                       if p.ticket == ticket), None)
+            if not pos:
+                return False
+            res = mt5.order_send({
+                "action":   mt5.TRADE_ACTION_SLTP,
+                "symbol":   self.symbol,
+                "position": ticket,
+                "sl":       pos.sl,
+                "tp":       new_tp,
+                "magic":    MAGIC_NUMBER,
+            })
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                self._log(
+                    f"🎯  [{self.name[:20]}] #{ticket} TP adjusted to "
+                    f"{new_tp:.5f} (balance-target gap update)", "INFO"
+                )
+                return True
+            self._log(
+                f"⚠️  [{self.name[:20]}] TP resync failed for #{ticket}: "
+                f"{getattr(res, 'comment', 'unknown error')}", "WARN"
+            )
+            return False
+        except Exception as e:
+            log.warning("TP resync error: %s", e)
+            return False
 
     def _check_risk_free(self, buy_pos: list, sell_pos: list):
         """
@@ -665,27 +846,52 @@ class SourceState:
             log.warning("Risk-free SL move error: %s", e)
             return False
 
-    def _get_close_price(self, position_ticket: int):
+    def _get_close_info(self, position_ticket: int):
         """
-        Fetch the exact execution price of the deal that closed this
-        position (DEAL_ENTRY_OUT), so the next pending order can be
-        anchored to reality instead of the original fixed line price.
-        Returns None if the deal can't be found (falls back to the
-        original anchor in that case).
+        Fetch the exact execution price AND the reason (SL/TP/manual/
+        other) of the deal that closed this position. Returns
+        (price, reason) where reason is one of "tp", "sl", "manual",
+        "other", or None if the deal can't be found.
+
+        Distinguishing TP from SL matters a lot here: a TP hit means
+        that round was WON outright — the position should reset to
+        IDLE, not chain into another martingale recovery order at a
+        bigger lot. Only an SL hit (a loss) should trigger the normal
+        double-up recovery cycle. Treating every close the same way
+        (as this used to) meant a winning TP close would immediately
+        re-arm a new pending stop anyway, which could go on to lose
+        and eat into profit that was already locked in.
         """
         try:
             deals = mt5.history_deals_get(position=position_ticket)
             if not deals:
-                return None
+                return None, None
             closing = [d for d in deals if d.entry == mt5.DEAL_ENTRY_OUT]
             if not closing:
-                return None
-            # Most recent closing deal for this position
+                return None, None
             closing.sort(key=lambda d: d.time, reverse=True)
-            return float(closing[0].price)
+            deal = closing[0]
+            price = float(deal.price)
+            d_reason = getattr(deal, "reason", None)
+            if d_reason == mt5.DEAL_REASON_TP:
+                reason = "tp"
+            elif d_reason == mt5.DEAL_REASON_SL:
+                reason = "sl"
+            elif d_reason in (mt5.DEAL_REASON_CLIENT, mt5.DEAL_REASON_MOBILE,
+                              mt5.DEAL_REASON_WEB, mt5.DEAL_REASON_EXPERT):
+                reason = "manual"
+            else:
+                reason = "other"
+            return price, reason
         except Exception as e:
-            log.warning("Could not fetch close price for #%s: %s", position_ticket, e)
-            return None
+            log.warning("Could not fetch close info for #%s: %s",
+                       position_ticket, e)
+            return None, None
+
+    def _get_close_price(self, position_ticket: int):
+        """Back-compat wrapper — price only. See _get_close_info."""
+        price, _ = self._get_close_info(position_ticket)
+        return price
 
     # ── New stop placement ────────────────────────────────────────
 
@@ -887,12 +1093,102 @@ class SourceState:
         self.state           = self.IDLE
         self._buy_confirmed  = False
         self._sell_confirmed = False
+        self.risk_free_applied = {"buy": False, "sell": False}
         self._log(f"🔄  [{self.name[:20]}] state reset to IDLE")
         try:
             from core.resume import clear_session
             clear_session(self.symbol)
         except Exception:
             pass
+
+    def _relocate_to_fresh_fvg(self):
+        """
+        After a fully-automatic reset (TP win or risk-free close), re-
+        anchor this source's main line to a freshly detected FVG and
+        immediately resume the touch-detection cycle, instead of
+        sitting idle waiting for a manual line move.
+
+        IMPORTANT: this does NOT touch the actual MT5 chart object
+        that originally created this source (e.g. a horizontal line
+        you drew). It only knows how to draw rectangles via the
+        command-file bridge (DRAW_RECT, used elsewhere for FVG
+        zones) — there's no confirmed command for creating/moving a
+        horizontal line, so guessing one risks silently doing nothing
+        on your EA. Trying to "move" the real chart object would also
+        be wrong anyway: that line is yours, and should keep meaning
+        whatever you intend it to mean even after this source's
+        martingale cycle finishes.
+
+        Instead, this source RENAMES itself to a synthetic,
+        watcher-internal name (no longer tied to any real chart
+        object name) and sets self._is_auto_relocated = True. The
+        watcher's "did a chart object move?" loop only ever iterates
+        names it just read FROM the chart file — a synthetic name
+        will never appear there, so it can never be mistaken for a
+        manual line move and reset again. watcher.py is responsible
+        for re-keying self._sources to this new name after calling
+        this (see _consume_relocation()).
+
+        Picks the most recent, currently-untouched FVG on the
+        smallest configured timeframe (1M) nearest to current price.
+        """
+        try:
+            from core.mtf_fvg import _scan_fvgs, TIMEFRAME_SPECS
+        except Exception as e:
+            log.warning("Could not import mtf_fvg for auto-relocate: %s", e)
+            return
+
+        try:
+            tick = mt5.symbol_info_tick(self.symbol)
+            if not tick:
+                return
+            bid, ask = tick.bid, tick.ask
+            mid = (bid + ask) / 2.0
+
+            tf_key = "1M"
+            spec   = TIMEFRAME_SPECS[tf_key]
+            fvgs = _scan_fvgs(
+                self.symbol, tf_key, spec["default_lookback"],
+                min_gap_pips=1.0, pip_size=self.pip_size, bid=bid, ask=ask
+            )
+            if not fvgs:
+                self._log(
+                    f"ℹ️  [{self.name[:20]}] auto-relocate: no fresh FVG "
+                    f"found yet — staying IDLE until one appears", "INFO"
+                )
+                return
+
+            # Nearest-to-price among the most recently formed gaps.
+            fvgs.sort(key=lambda f: abs(((f.top + f.bottom) / 2.0) - mid))
+            best = fvgs[0]
+            new_price = round((best.top + best.bottom) / 2.0, 5)
+
+            old_name  = self.name
+            old_price = self.price
+
+            # Synthetic name, never matched against real chart object
+            # names — strip any leading "AUTO_" chain so repeated
+            # auto-relocations don't grow an ever-longer prefix.
+            base_label = old_name
+            if base_label.startswith("AUTO_"):
+                base_label = base_label.split("_", 2)[-1]
+            self.pending_rename = f"AUTO_{int(mid*100)}_{base_label}"
+            self.name   = self.pending_rename
+            self.price  = new_price
+            self._prev_tick_price = mid
+            self.last_prev_t   = 0
+            self.registered_at = 0
+            self._is_auto_relocated = True
+
+            self._log(
+                f"🆕  [{old_name[:20]}] auto-relocated {old_price:.5f} → "
+                f"{new_price:.5f} as [{self.name[:25]}] (fresh {best.kind} "
+                f"1M FVG {best.bottom:.5f}-{best.top:.5f}, {best.gap_pips}p) "
+                f"| waiting for candle touch", "NEW"
+            )
+        except Exception as e:
+            log.warning("Auto-relocate to fresh FVG failed: %s", e)
+
 
     @property
     def summary(self) -> dict:

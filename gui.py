@@ -287,7 +287,9 @@ class GUI(QMainWindow):
         self.spin_balance_tp.setValue(10.0); self.spin_balance_tp.setDecimals(1)
         self.spin_balance_tp.setSuffix(" %")
         _row("💰 Balance TP:", self.spin_balance_tp, cl,
-             "Close all & stop when balance grows by this % from start")
+             "Account-wide stop level (close all & stop here). "
+             "Each position's own TP ramps from 1% at base lot, "
+             "doubling with lot size, capped at this %.")
 
         self.chk_follow = QCheckBox("Follow moved lines")
         self.chk_follow.setChecked(True)
@@ -860,9 +862,9 @@ class GUI(QMainWindow):
 
         grp_pos = QGroupBox("🟢  Open Positions")
         posv = QVBoxLayout(grp_pos); posv.setContentsMargins(4, 4, 4, 4)
-        self.tbl_positions = QTableWidget(0, 6)
+        self.tbl_positions = QTableWidget(0, 8)
         self.tbl_positions.setHorizontalHeaderLabels(
-            ["Ticket", "Type", "Entry", "SL", "Volume", "P&L"])
+            ["Ticket", "Type", "Entry", "SL", "TP", "TP%", "Volume", "P&L"])
         self.tbl_positions.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tbl_positions.setAlternatingRowColors(True)
         self.tbl_positions.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1258,6 +1260,8 @@ class GUI(QMainWindow):
             self.tbl_positions.setRowCount(len(bot_pos))
             total_pnl = 0.0
             buys = sells = 0
+            base_lot_now = self.spin_lot.value()
+            full_pct_now = self.spin_balance_tp.value()  # e.g. 10.0
             for r, p in enumerate(bot_pos):
                 is_buy = p.type == 0
                 clr    = QColor(C['green'] if is_buy else C['red'])
@@ -1265,10 +1269,22 @@ class GUI(QMainWindow):
                 total_pnl += p.profit
                 if is_buy: buys += 1
                 else: sells += 1
+
+                # Live TP% this position is actually targeting right
+                # now — ramps from 1% at base_lot, doubling with lot
+                # size, capped at the GUI's Balance TP% setting. Must
+                # match the formula in position_monitor.py exactly.
+                if base_lot_now > 0:
+                    lot_ratio  = p.volume / base_lot_now
+                    tp_pct_now = min(1.0 * lot_ratio, full_pct_now)
+                else:
+                    tp_pct_now = 0.0
+
                 vals = [str(p.ticket), "BUY" if is_buy else "SELL",
                         f"{p.price_open:.5f}", f"{p.sl:.5f}",
+                        f"{p.tp:.5f}", f"{tp_pct_now:.1f}%",
                         f"{p.volume:.2f}", f"{p.profit:+.2f}"]
-                cols = [clr, clr, clr, clr, clr, pnl_c]
+                cols = [clr, clr, clr, clr, clr, clr, clr, pnl_c]
                 for c, (v, co) in enumerate(zip(vals, cols)):
                     it = QTableWidgetItem(v); it.setForeground(co)
                     self.tbl_positions.setItem(r, c, it)

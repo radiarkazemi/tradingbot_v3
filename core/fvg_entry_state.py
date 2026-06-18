@@ -84,21 +84,20 @@ class FVGEntryState(SourceState):
         # = bottom + 3*dist
         return _round_price(self._sell_entry + 2 * self._dist, self.symbol)
 
-    # ── Re-anchoring on SL close (zero-spread fix) ──────────────────
-    # BUY and SELL entries here are independent edges (top vs bottom),
-    # not mirrored around one shared center like the base class. So
-    # re-anchoring on a BUY close only shifts fvg_top (which is all
-    # _buy_entry depends on); fvg_bottom / the SELL side is untouched.
-    # This also means the FVG's height changes slightly if the close
-    # price drifted from the original edge, which correctly carries
-    # through to a slightly adjusted TP (still height x 3) rather than
-    # silently keeping a stale height.
+    # ── Re-anchoring on SL close ─────────────────────────────────────
+    # No-op, matching the base class. fvg_top/fvg_bottom are the
+    # detected zone — they should stay exactly as detected across the
+    # whole martingale cycle, not drift round-to-round based on real
+    # fill prices. (This used to shift the relevant edge toward the
+    # real close price; reverted for consistency with the base-class
+    # fix and to avoid the zone slowly walking away from the actual
+    # structure over multiple recovery rounds.)
 
     def _reanchor_buy(self, close_price: float):
-        self.fvg_top = close_price + self._dist
+        pass
 
     def _reanchor_sell(self, close_price: float):
-        self.fvg_bottom = close_price - self._dist
+        pass
 
     # ── Take profit: 1:3 RR based on FVG height ────────────────────
 

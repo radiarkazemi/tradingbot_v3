@@ -437,7 +437,7 @@ class WatcherThread(threading.Thread):
                 # briefly clears the file while rewriting it.
                 for n in list(self._sources.keys()):
                     if n not in cur_names:
-                        if n.startswith("RESUMED_"):
+                        if n.startswith("RESUMED_") or n.startswith("AUTO_"):
                             continue
                         self._missing_counts[n] = self._missing_counts.get(n, 0) + 1
                         if self._missing_counts[n] >= REMOVAL_GRACE:
@@ -451,13 +451,32 @@ class WatcherThread(threading.Thread):
                         # Present this scan — clear any pending removal counter
                         self._missing_counts.pop(n, None)
 
+                # ── Consume pending renames from auto-relocated sources ──
+                # _relocate_to_fresh_fvg() (in position_monitor.py) renames
+                # a SourceState to a synthetic key when it re-anchors to a
+                # fresh FVG after a TP win / risk-free close, so the
+                # "moved lines" comparison below (which trusts the chart
+                # file as ground truth) can never mistake that internal
+                # change for you moving the real chart object and revert
+                # it. SourceState has no reference to self._sources, so
+                # the actual dict re-keying has to happen here.
+                for old_n, st in list(self._sources.items()):
+                    new_n = getattr(st, "pending_rename", None)
+                    if new_n and new_n != old_n:
+                        del self._sources[old_n]
+                        self._sources[new_n] = st
+                        st.pending_rename = None
+                        self._seen.discard(old_n)
+                        self._seen.add(new_n)
+                        self._missing_counts.pop(old_n, None)
+
                 # ── Moved lines ───────────────────────────────────
                 if self.follow_enabled:
                     for o in objects:
                         n = o.name
                         if n not in self._sources:
                             continue
-                        if n.startswith("RESUMED_"):
+                        if n.startswith("RESUMED_") or n.startswith("AUTO_"):
                             continue
                         state     = self._sources[n]
                         new_price = None
@@ -529,21 +548,75 @@ class WatcherThread(threading.Thread):
         # mt5.shutdown() is called here — after the loop exits — so all
         # watchers have already been stopped by the GUI's _stop() handler
         # before MT5 loses connection.
-        mt5.shutdown()
+        #
+        # Each Python process that calls mt5.initialize() gets its own
+        # connection handle to the shared terminal — shutdown() here
+        # only tears down THIS process's handle, not a sibling
+        # gui.py process's connection to the same terminal. Wrapped in
+        # try/except purely so that if the shared terminal IPC is
+        # under load from other instances at this exact moment, a
+        # slow/odd shutdown response can't turn a clean stop into an
+        # unhandled crash.
+        try:
+            mt5.shutdown()
+        except Exception as e:
+            self.log(f"⚠️  mt5.shutdown() raised on exit: {e} (non-fatal)", "WARN")
         self.sig.emit_status("⚫  Stopped")
         self.log("Bot stopped.")
 
     def _connect(self) -> bool:
-        if not mt5.initialize(login=cfg.MT5_LOGIN,
-                              password=cfg.MT5_PASSWORD,
-                              server=cfg.MT5_SERVER):
-            self.log(f"❌ MT5 connection failed: {mt5.last_error()}", "ERROR")
-            self.sig.emit_status("❌  MT5 connection failed")
-            return False
-        info = mt5.account_info()
-        self.log(
-            f"✅ Connected: {info.name} | "
-            f"Balance: {info.balance:.2f} {info.currency}"
-        )
-        self.sig.emit_status(f"🟢  Connected — {info.name}")
-        return True
+        """
+        Connect to the shared MT5 terminal, with retries.
+
+        Running several gui.py processes against ONE MT5 terminal is
+        supported (one account, multiple symbols) — but real users
+        have reported transient IPC contention when several Python
+        processes call mt5.initialize()/login() against the same
+        terminal at nearly the same moment (e.g. starting 2-3 bots
+        within a second of each other). A short retry-with-backoff
+        here absorbs that without the whole bot instance dying on a
+        one-off hiccup.
+        """
+        MAX_ATTEMPTS = 5
+        last_error   = None
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            try:
+                ok = mt5.initialize(login=cfg.MT5_LOGIN,
+                                    password=cfg.MT5_PASSWORD,
+                                    server=cfg.MT5_SERVER)
+            except Exception as e:
+                ok = False
+                last_error = e
+
+            if ok:
+                info = mt5.account_info()
+                if info:
+                    self.log(
+                        f"✅ Connected: {info.name} | "
+                        f"Balance: {info.balance:.2f} {info.currency}"
+                    )
+                    self.sig.emit_status(f"🟢  Connected — {info.name}")
+                    return True
+                # initialize() said True but account_info() came back
+                # empty — also a known symptom of contention with
+                # another process connecting at the same instant.
+                last_error = "account_info() returned None after initialize()"
+
+            last_error = last_error or mt5.last_error()
+            if attempt < MAX_ATTEMPTS:
+                wait_s = min(2 * attempt, 8)
+                self.log(
+                    f"⚠️  MT5 connect attempt {attempt}/{MAX_ATTEMPTS} failed "
+                    f"({last_error}) — retrying in {wait_s}s "
+                    f"(this can happen when multiple bot instances connect "
+                    f"to the same terminal at once)", "WARN"
+                )
+                self._stop_event.wait(wait_s)
+                if self._stop_event.is_set():
+                    return False
+
+        self.log(f"❌ MT5 connection failed after {MAX_ATTEMPTS} attempts: "
+                 f"{last_error}", "ERROR")
+        self.sig.emit_status("❌  MT5 connection failed")
+        return False

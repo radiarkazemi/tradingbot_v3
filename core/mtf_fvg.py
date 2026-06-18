@@ -78,7 +78,7 @@ TIMEFRAME_SPECS = {
 TIMEFRAME_ORDER = ["15M", "5M", "1M"]   # largest → smallest
 
 # Minimum recency window floor, in seconds, regardless of computed scale.
-MIN_RECENCY_SECONDS = 300   # 5 minutes
+MIN_RECENCY_SECONDS = 900   # 15 minutes
 
 
 @dataclass
@@ -148,11 +148,26 @@ class MTFZone:
 
 def _scan_fvgs(symbol: str, tf_key: str, lookback: int, min_gap_pips: float,
                pip_size: float, bid: float, ask: float) -> List[SingleFVG]:
-    """Scan one timeframe for active (non-mitigated) FVGs."""
+    """
+    Scan one timeframe for active (non-mitigated) FVGs.
+
+    CRITICAL: mt5.copy_rates_from_pos(..., 0, n) includes the currently
+    forming (incomplete) candle at the most recent position. Its high/
+    low keep changing every tick, so using it as the "third candle" of
+    a 3-candle FVG pattern produces a gap that flickers in and out of
+    existence and can hide an otherwise-obvious, fully-formed gap that
+    sits right at this boundary. We drop it before scanning — only
+    fully closed candles are used.
+    """
     spec      = TIMEFRAME_SPECS[tf_key]
     min_gap   = min_gap_pips * pip_size
-    bars      = mt5.copy_rates_from_pos(symbol, spec["mt5_tf"], 0, lookback + 3)
-    if bars is None or len(bars) < 3:
+    raw_bars  = mt5.copy_rates_from_pos(symbol, spec["mt5_tf"], 0, lookback + 4)
+    if raw_bars is None or len(raw_bars) < 4:
+        return []
+
+    # Drop the still-forming candle (index -1, the most recent).
+    bars = raw_bars[:-1]
+    if len(bars) < 3:
         return []
 
     fvgs = []
@@ -208,18 +223,17 @@ def _overlap(a_bot: float, a_top: float, b_bot: float, b_top: float):
 def _recency_window_seconds(outer_tf: str, inner_tf: str) -> int:
     """
     Scales the recency window by how many inner-timeframe bars fit
-    inside one outer-timeframe bar, with a sane floor. e.g.:
-      15M→5M:  900/300=3   → window = max(3, 3) bars of 5M  × 300s = 900s  (but floored to MIN)
-      15M→1M:  900/60=15   → window = 15 bars of 1M × 60s = 900s
-      5M→1M:   300/60=5    → window = 5 bars of 1M × 60s = 300s
-    The intent: allow roughly "one outer bar's worth" of slack for the
-    inner FVG to have formed, since that's the natural time relationship
-    between the two timeframes.
+    inside roughly THREE outer-timeframe bars, with a sane floor.
+    A confirming inner-timeframe FVG can reasonably form anywhere
+    within a few outer candles of the outer FVG it's confirming —
+    not just within one outer bar's duration, which is too tight and
+    rejects plenty of real, valid confluences. e.g.:
+      15M→5M:  3 x 900s = 2700s (45 min)
+      15M→1M:  3 x 900s = 2700s (45 min)
+      5M→1M:   3 x 300s = 900s  (15 min)
     """
     outer_sec = TIMEFRAME_SPECS[outer_tf]["bar_seconds"]
-    inner_sec = TIMEFRAME_SPECS[inner_tf]["bar_seconds"]
-    ratio     = max(1, outer_sec // inner_sec)
-    window    = ratio * inner_sec
+    window    = outer_sec * 3
     return max(window, MIN_RECENCY_SECONDS)
 
 

@@ -80,6 +80,19 @@ class SourceState:
         self.registered_at   = 0
         self.last_prev_t     = 0
 
+        # ── Risk-free mechanism ───────────────────────────────────
+        # Once an open position's floating profit reaches 2R (R =
+        # the price distance to its own SL at entry), its SL is moved
+        # to lock in +1R profit instead of just breakeven. After that
+        # risk-free SL is applied, the position closing for ANY
+        # reason (hit the new SL, manually closed, etc.) triggers a
+        # full reset of this source back to IDLE — including chart
+        # object cleanup, handled by the watcher layer via
+        # needs_full_reset. The opposite pending stop order is left
+        # completely untouched by this mechanism.
+        self.risk_free_applied = {"buy": False, "sell": False}
+        self.needs_full_reset  = False   # watcher checks/clears this
+
         # ── Tick-based touch detection (timeframe-immune) ─────────
         # Switching the MT5 chart's timeframe view changes what the EA
         # reports as CANDLE_T/PREV_T (different bar boundaries), which
@@ -110,15 +123,76 @@ class SourceState:
     def _sell_sl_price(self):  # SL of SELL = BUY entry (exact mirror)
         return self._buy_entry
 
+    def _reanchor_buy(self, close_price: float):
+        """
+        Re-anchor self.price so _buy_entry recalculates to exactly
+        close_price (the real SL fill price of the just-closed BUY
+        position), eliminating slippage drift. Override in subclasses
+        that don't derive entry/SL from self.price directly (e.g.
+        FVGEntryState, which uses fvg_top/fvg_bottom instead).
+        """
+        self.price = close_price - self._dist
+
+    def _reanchor_sell(self, close_price: float):
+        """Re-anchor self.price so _sell_entry recalculates to exactly
+        close_price. See _reanchor_buy."""
+        self.price = close_price + self._dist
+
+    @property
+    def _dynamic_tp_pips(self) -> float:
+        """
+        TP distance in pips, growing as the martingale lot grows.
+
+        base_tp_pips = dist_pips × 3  (same 1:3 RR convention used by
+        MTF FVG entries elsewhere in the bot)
+
+        Scales by the ratio of the CURRENT lot (whichever side is
+        about to be placed/modified — callers read this once per side)
+        to base_lot, so each time the lot doubles on a martingale round,
+        the TP distance grows proportionally. A round-1 0.01 lot trade
+        and a round-4 0.08 lot trade are not equally easy to recover
+        from at the same pip distance — the larger the lot, the more
+        room is given for the position to capture a real trending move
+        before locking in profit, rather than scalping a now much
+        bigger position for the same small price move.
+        """
+        base_tp_pips = self.dist_pips * 3
+        if self.base_lot <= 0:
+            return base_tp_pips
+        # Use whichever lot is larger right now (covers the moment
+        # right after one side activates and the other side's lot has
+        # just been doubled, before both are equal again).
+        current_lot = max(self.buy_lot, self.sell_lot, self.base_lot)
+        ratio       = current_lot / self.base_lot
+        return base_tp_pips * ratio
+
     @property
     def _buy_tp_price(self):
-        """Override in subclasses for a fixed TP. Base class: no TP (0.0)."""
-        return 0.0
+        """
+        Dynamic TP that grows with lot size — see _dynamic_tp_pips.
+        Base class previously had no TP at all (0.0, let it run with
+        trend indefinitely); this keeps that "ride the trend" spirit
+        but gives a concrete, ever-widening target as the position
+        grows, rather than no target at all.
+        """
+        tp_dist = self._dynamic_tp_pips * self.pip_size
+        return _round_price(self._buy_entry + tp_dist, self.symbol)
 
     @property
     def _sell_tp_price(self):
-        """Override in subclasses for a fixed TP. Base class: no TP (0.0)."""
-        return 0.0
+        """Dynamic TP that grows with lot size — see _dynamic_tp_pips."""
+        tp_dist = self._dynamic_tp_pips * self.pip_size
+        return _round_price(self._sell_entry - tp_dist, self.symbol)
+
+    @property
+    def _buy_r_distance(self) -> float:
+        """1R for the BUY side = distance from BUY entry to BUY's SL."""
+        return abs(self._buy_entry - self._buy_sl_price)
+
+    @property
+    def _sell_r_distance(self) -> float:
+        """1R for the SELL side = distance from SELL entry to SELL's SL."""
+        return abs(self._sell_entry - self._sell_sl_price)
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -465,26 +539,153 @@ class SourceState:
         if in_grace:
             return
 
+        # ── Risk-free: move SL to lock +1R once floating profit ≥2R ─
+        self._check_risk_free(buy_pos, sell_pos)
+
         # ── Detect closed positions → place new stop ──────────────
+        # Pass the EXACT price the closed position's SL executed at,
+        # so the new same-side pending order anchors to that real
+        # fill price instead of recalculating from the original fixed
+        # line/zone anchor. Slippage on the SL fill would otherwise
+        # leave a small gap between where the position actually closed
+        # and where the new order sits, adding delay before it can
+        # trigger again.
         if (self.buy_pos_ticket
                 and self.buy_pos_ticket not in open_tickets
                 and self._buy_confirmed):
+            closed_ticket = self.buy_pos_ticket
+            close_price   = self._get_close_price(closed_ticket)
+            was_risk_free = self.risk_free_applied.get("buy", False)
             self._log(
-                f"📉  [{self.name[:20]}] BUY pos#{self.buy_pos_ticket} closed", "WARN"
+                f"📉  [{self.name[:20]}] BUY pos#{closed_ticket} closed"
+                + (f" @ {close_price:.5f}" if close_price else "")
+                + (" (was risk-free)" if was_risk_free else ""), "WARN"
             )
             self.buy_pos_ticket = None
             self._buy_confirmed = False
-            self._place_new_buy_stop()
+            if was_risk_free:
+                # Risk-free profit was locked in — this slot is done.
+                # Cancel the still-pending opposite stop, mark for a
+                # full reset (chart object cleanup is the watcher's
+                # job), and do NOT start a new recovery cycle.
+                self._log(
+                    f"🟢  [{self.name[:20]}] risk-free BUY closed — "
+                    f"resetting to IDLE, waiting for a fresh entry", "NEW"
+                )
+                self.needs_full_reset = True
+                self.reset()
+            else:
+                self._place_new_buy_stop(anchor_price=close_price)
 
         if (self.sell_pos_ticket
                 and self.sell_pos_ticket not in open_tickets
                 and self._sell_confirmed):
+            closed_ticket = self.sell_pos_ticket
+            close_price   = self._get_close_price(closed_ticket)
+            was_risk_free = self.risk_free_applied.get("sell", False)
             self._log(
-                f"📉  [{self.name[:20]}] SELL pos#{self.sell_pos_ticket} closed", "WARN"
+                f"📉  [{self.name[:20]}] SELL pos#{closed_ticket} closed"
+                + (f" @ {close_price:.5f}" if close_price else "")
+                + (" (was risk-free)" if was_risk_free else ""), "WARN"
             )
             self.sell_pos_ticket = None
             self._sell_confirmed = False
-            self._place_new_sell_stop()
+            if was_risk_free:
+                self._log(
+                    f"🔴  [{self.name[:20]}] risk-free SELL closed — "
+                    f"resetting to IDLE, waiting for a fresh entry", "NEW"
+                )
+                self.needs_full_reset = True
+                self.reset()
+            else:
+                self._place_new_sell_stop(anchor_price=close_price)
+
+    def _check_risk_free(self, buy_pos: list, sell_pos: list):
+        """
+        Once an open position's floating profit reaches 2R, move its
+        SL to lock in +1R instead of the original SL. R is the price
+        distance between that side's entry and its own SL at entry
+        time (computed once via _buy_r_distance/_sell_r_distance and
+        cached in risk_free_applied so this only fires once per
+        position). The opposite pending stop order is left untouched.
+        """
+        if buy_pos and not self.risk_free_applied.get("buy", False):
+            pos = sorted(buy_pos, key=lambda p: p.time, reverse=True)[0]
+            r = self._buy_r_distance
+            if r > 0:
+                profit_dist = pos.price_current - pos.price_open
+                if profit_dist >= 2 * r:
+                    new_sl = _round_price(pos.price_open + 1 * r, self.symbol)
+                    if self._move_position_sl(pos.ticket, new_sl):
+                        self.risk_free_applied["buy"] = True
+                        self._log(
+                            f"🛡️  [{self.name[:20]}] BUY risk-free | "
+                            f"profit={profit_dist:.5f} ≥ 2R={2*r:.5f} | "
+                            f"SL moved to {new_sl:.5f} (+1R locked)", "NEW"
+                        )
+
+        if sell_pos and not self.risk_free_applied.get("sell", False):
+            pos = sorted(sell_pos, key=lambda p: p.time, reverse=True)[0]
+            r = self._sell_r_distance
+            if r > 0:
+                profit_dist = pos.price_open - pos.price_current
+                if profit_dist >= 2 * r:
+                    new_sl = _round_price(pos.price_open - 1 * r, self.symbol)
+                    if self._move_position_sl(pos.ticket, new_sl):
+                        self.risk_free_applied["sell"] = True
+                        self._log(
+                            f"🛡️  [{self.name[:20]}] SELL risk-free | "
+                            f"profit={profit_dist:.5f} ≥ 2R={2*r:.5f} | "
+                            f"SL moved to {new_sl:.5f} (+1R locked)", "NEW"
+                        )
+
+    def _move_position_sl(self, ticket: int, new_sl: float) -> bool:
+        """Modify an open position's SL via TRADE_ACTION_SLTP."""
+        try:
+            pos = next((p for p in (mt5.positions_get(symbol=self.symbol) or [])
+                       if p.ticket == ticket), None)
+            if not pos:
+                return False
+            res = mt5.order_send({
+                "action":   mt5.TRADE_ACTION_SLTP,
+                "symbol":   self.symbol,
+                "position": ticket,
+                "sl":       new_sl,
+                "tp":       pos.tp,
+                "magic":    MAGIC_NUMBER,
+            })
+            if res and res.retcode == mt5.TRADE_RETCODE_DONE:
+                return True
+            self._log(
+                f"⚠️  [{self.name[:20]}] risk-free SL move failed for #{ticket}: "
+                f"{getattr(res, 'comment', 'unknown error')}", "WARN"
+            )
+            return False
+        except Exception as e:
+            log.warning("Risk-free SL move error: %s", e)
+            return False
+
+    def _get_close_price(self, position_ticket: int):
+        """
+        Fetch the exact execution price of the deal that closed this
+        position (DEAL_ENTRY_OUT), so the next pending order can be
+        anchored to reality instead of the original fixed line price.
+        Returns None if the deal can't be found (falls back to the
+        original anchor in that case).
+        """
+        try:
+            deals = mt5.history_deals_get(position=position_ticket)
+            if not deals:
+                return None
+            closing = [d for d in deals if d.entry == mt5.DEAL_ENTRY_OUT]
+            if not closing:
+                return None
+            # Most recent closing deal for this position
+            closing.sort(key=lambda d: d.time, reverse=True)
+            return float(closing[0].price)
+        except Exception as e:
+            log.warning("Could not fetch close price for #%s: %s", position_ticket, e)
+            return None
 
     # ── New stop placement ────────────────────────────────────────
 
@@ -513,13 +714,22 @@ class SourceState:
             log.warning("Margin check error: %s", e)
             return True
 
-    def _place_new_buy_stop(self):
+    def _place_new_buy_stop(self, anchor_price: float = None):
         self.round  += 1
         new_buy_lot  = round(self.sell_lot * 2, 2)
         self.buy_lot = max(new_buy_lot, 0.01)
 
         if not self._can_afford(self.buy_lot, is_buy=True):
             return
+
+        # Re-anchor from the EXACT price the previous BUY position's
+        # SL closed at (rather than the original fixed line/zone
+        # price), eliminating any slippage-induced gap. Delegated to
+        # _reanchor_buy() since subclasses (e.g. FVGEntryState) derive
+        # entry/SL/TP from different fields than self.price and need
+        # their own re-anchoring logic.
+        if anchor_price is not None:
+            self._reanchor_buy(anchor_price)
 
         order = {"type": "BUY_STOP", "entry": self._buy_entry,
                  "sl": self._buy_sl_price, "tp": self._buy_tp_price,
@@ -543,13 +753,18 @@ class SourceState:
             )
             _save(self)
 
-    def _place_new_sell_stop(self):
+    def _place_new_sell_stop(self, anchor_price: float = None):
         self.round   += 1
         new_sell_lot  = round(self.buy_lot * 2, 2)
         self.sell_lot = max(new_sell_lot, 0.01)
 
         if not self._can_afford(self.sell_lot, is_buy=False):
             return
+
+        # Re-anchor from the EXACT price the previous SELL position's
+        # SL closed at — see matching comment in _place_new_buy_stop.
+        if anchor_price is not None:
+            self._reanchor_sell(anchor_price)
 
         order = {"type": "SELL_STOP", "entry": self._sell_entry,
                  "sl": self._sell_sl_price, "tp": self._sell_tp_price,

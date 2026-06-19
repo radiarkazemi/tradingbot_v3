@@ -307,6 +307,16 @@ class GUI(QMainWindow):
         self.chk_resume.setStyleSheet(f"color:{C['orange']};")
         cl.addWidget(self.chk_resume)
 
+        self.chk_risk_free = QCheckBox("🛡  Enable Risk-Free")
+        self.chk_risk_free.setChecked(False)
+        self.chk_risk_free.setToolTip(
+            "When a position's floating profit reaches 2× its risk,\n"
+            "move its SL to lock in +1R guaranteed profit.\n"
+            "On close the bot resets and waits for a fresh entry.")
+        self.chk_risk_free.setStyleSheet(f"color:{C['cyan']};font-weight:bold;")
+        self.chk_risk_free.toggled.connect(self._on_risk_free_toggled)
+        cl.addWidget(self.chk_risk_free)
+
         cl.addWidget(_hline())
 
         self.btn_start = QPushButton("▶  Start Watcher")
@@ -911,10 +921,11 @@ class GUI(QMainWindow):
         self.lbl_sym_hdr.setText(sym)
 
         self._worker = WatcherThread(
-            symbol         = sym,
-            lot_size       = lot,
-            follow_enabled = follow,
-            resume_enabled = self.chk_resume.isChecked(),
+            symbol            = sym,
+            lot_size          = lot,
+            follow_enabled    = follow,
+            resume_enabled    = self.chk_resume.isChecked(),
+            risk_free_enabled = self.chk_risk_free.isChecked(),
         )
         self._worker.sig.on_log(    lambda m, l: self._sig.log_line.emit(m, l))
         self._worker.sig.on_status( lambda s:    self._sig.status.emit(s))
@@ -1386,6 +1397,20 @@ class GUI(QMainWindow):
         )
         self._amd_worker.start()
 
+    def _on_risk_free_toggled(self, checked: bool):
+        """
+        Push the Enable Risk-Free checkbox state into the running
+        watcher immediately, so toggling it mid-session actually takes
+        effect instead of silently doing nothing until the next start.
+        """
+        if self._worker:
+            self._worker.set_risk_free_enabled(checked)
+        else:
+            self._sig.log_line.emit(
+                f"🛡️  Risk-Free will be {'ENABLED' if checked else 'DISABLED'} "
+                f"when the bot starts", "INFO"
+            )
+
     def _on_amd_toggled(self, state):
         if not self._worker:
             return
@@ -1412,17 +1437,14 @@ class GUI(QMainWindow):
             if self._amd_worker:
                 s = self._amd_worker.get_status()
                 if s:
-                    def ic(label):
-                        if "(" in label and ")" in label:
-                            ph = label[label.index("(")+1:label.index(")")]
-                            return {"A":"🟩","M":"🟥","D":"🟦","C":"⬜"}.get(ph,"⬜")
-                        return "⬜"
+                    phase_icon = {"A": "🟩", "M": "🟥", "D": "🟦", "C": "⬜"}
+                    di = phase_icon.get(s.day,   "")
+                    wi = phase_icon.get(s.week,  "")
+                    mi = phase_icon.get(s.month, "")
                     self.lbl_amd_status.setText(
-                        f"Y:{s.year}  {ic(s.quarter)}{s.quarter}  "
-                        f"{ic(s.month)}{s.month}  {ic(s.week)}{s.week}\n"
-                        f"{ic(s.day)}{s.day}  4H:{ic(s.h4)}{s.h4}  "
-                        f"1H:{ic(s.h1)}{s.h1}\n"
-                        f"5M:{ic(s.m5)}{s.m5}  1M:{ic(s.minute)}{s.minute}"
+                        f"Y:{s.year}  {s.quarter}\n"
+                        f"Month: {mi}{s.month}  Week: {wi}{s.week}  Day: {di}{s.day}\n"
+                        f"Session: {s.h4}  Hour: {s.h1}  5min: {s.m5}  1min: {s.minute}"
                     )
             elif not self.chk_amd.isChecked():
                 self.lbl_amd_status.setText("AMD: — (disabled)")

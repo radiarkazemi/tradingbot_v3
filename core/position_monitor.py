@@ -47,7 +47,8 @@ class SourceState:
     EXHAUSTED = "exhausted"
 
     def __init__(self, name, price, pip_size, symbol, base_lot, dist_pips,
-                 start_balance=0.0, log_fn=None, stop_fn=None):
+                 start_balance=0.0, log_fn=None, stop_fn=None,
+                 risk_free_enabled=False):
         self.name          = name
         self.price         = price
         self.pip_size      = pip_size
@@ -57,6 +58,7 @@ class SourceState:
         self.start_balance = start_balance
         self._log          = log_fn or (lambda msg, level="INFO": log.info(msg))
         self._stop_fn      = stop_fn
+        self._risk_free_enabled = risk_free_enabled
 
         self.state           = self.IDLE
         self.round           = 0
@@ -70,6 +72,8 @@ class SourceState:
         self.sell_lot        = base_lot
         self.buy_sl          = None
         self.sell_sl         = None
+        self.buy_r_frozen    = 0.0
+        self.sell_r_frozen   = 0.0
 
         self._buy_confirmed  = False
         self._sell_confirmed = False
@@ -93,6 +97,22 @@ class SourceState:
         self.risk_free_applied = {"buy": False, "sell": False}
         self.needs_full_reset  = False   # watcher checks/clears this
 
+        # ── Cumulative loss tracking (for TP sizing) ──────────────
+        # Tracks total dollar loss across all closed losing positions
+        # in this martingale cycle. Reset to 0 on a full reset (win
+        # or risk-free close). Used by _balance_target_tp_pips to
+        # set TP based on actual loss accumulated, not a theoretical
+        # estimate — the TP at each round must cover the real losses
+        # already taken, plus the current SL risk, times the target RR.
+        self.cumulative_loss = 0.0
+        self._pip_value_per_base_lot = 0.0  # calibrated from real SL closes
+
+        # Original chart-object name before any auto-relocate rename —
+        # used by watcher.py to remove the original chart-object-backed
+        # source when this one auto-relocates, preventing duplicate
+        # position placement if the chart line ends up near the new FVG.
+        self.original_chart_name = name
+
         # ── Auto-relocate (TP win / risk-free → fresh FVG) ──────────
         # When _relocate_to_fresh_fvg() renames this instance to a
         # synthetic key (so the watcher's chart-object move-detection
@@ -103,6 +123,8 @@ class SourceState:
         # SourceState itself since it has no reference to that dict.
         self.pending_rename     = None
         self._is_auto_relocated = False
+        self._relocated_at         = 0.0
+        self._relocated_from_price = None
 
         # ── Tick-based touch detection (timeframe-immune) ─────────
         # Switching the MT5 chart's timeframe view changes what the EA
@@ -113,25 +135,74 @@ class SourceState:
         # chart's displayed timeframe.
         self._prev_tick_price = None   # last seen mid price, for crossing detection
 
+        self._log(
+            f"⚙️  [{self.name[:20]}] risk_free_enabled = {self._risk_free_enabled}",
+            "INFO"
+        )
+
     # ── Fixed price properties (never drift) ──────────────────────
     @property
     def _dist(self):
         return self.dist_pips * self.pip_size
 
+    def _current_spread(self) -> float:
+        """
+        Current bid-ask spread in price units, fetched live from MT5.
+        Used to compensate order entry prices so the EFFECTIVE fill
+        price (what MT5 actually executes at) matches the intended
+        level exactly, regardless of current spread width.
+
+        BUY_STOP fills at ask: to get a fill at `intended`, place the
+        stop at `intended − spread` so that when bid reaches
+        (intended − spread), ask = intended and the fill is exact.
+
+        SELL_STOP fills at bid: to get a fill at `intended`, place the
+        stop at `intended + spread` so that when ask reaches
+        (intended + spread), bid = intended and the fill is exact.
+
+        Returns 0.0 on failure (no compensation applied, safe fallback).
+        """
+        try:
+            tick = mt5.symbol_info_tick(self.symbol)
+            if tick and tick.ask > 0 and tick.bid > 0:
+                return round(tick.ask - tick.bid, 5)
+        except Exception:
+            pass
+        return 0.0
+
     @property
     def _buy_entry(self):
-        return _round_price(self.price + self._dist, self.symbol)
+        """BUY_STOP entry price, spread-compensated so the effective
+        MT5 fill lands exactly at price + dist regardless of spread."""
+        raw   = _round_price(self.price + self._dist, self.symbol)
+        spread = self._current_spread()
+        return _round_price(raw - spread, self.symbol)
 
     @property
     def _sell_entry(self):
-        return _round_price(self.price - self._dist, self.symbol)
+        """SELL_STOP entry price, spread-compensated so the effective
+        MT5 fill lands exactly at price − dist regardless of spread."""
+        raw   = _round_price(self.price - self._dist, self.symbol)
+        spread = self._current_spread()
+        return _round_price(raw + spread, self.symbol)
 
     @property
-    def _buy_sl_price(self):   # SL of BUY  = SELL entry (exact mirror)
+    def _buy_sl_price(self):
+        """
+        SL of BUY = EXACTLY the SELL side's real entry price
+        (_sell_entry, including its spread compensation) — not the
+        theoretical pre-spread line position. This is what makes BUY's
+        SL land exactly where SELL actually fills, with zero gap,
+        matching the bot's whole "zero spread" design intent: if the
+        SELL position is sitting at 4134.97, BUY's SL must be 4134.97,
+        not some epsilon above or below it.
+        """
         return self._sell_entry
 
     @property
-    def _sell_sl_price(self):  # SL of SELL = BUY entry (exact mirror)
+    def _sell_sl_price(self):
+        """SL of SELL = EXACTLY the BUY side's real entry price
+        (_buy_entry). See _buy_sl_price — same reasoning, mirrored."""
         return self._buy_entry
 
     def _reanchor_buy(self, close_price: float):
@@ -161,127 +232,145 @@ class SourceState:
 
     def _dollar_per_pip(self, lot: float) -> float:
         """
-        Dollar profit (account currency) for exactly 1 pip of favorable
-        price movement at the given lot size, for this symbol. Uses
-        mt5.order_calc_profit() — the broker's own calculation engine
-        — so this is correct regardless of contract size, tick size/
-        value quirks, or profit-currency conversion, none of which
-        need to be reasoned about manually here.
-
-        Falls back to a manual tick-value-based calculation if
-        order_calc_profit is unavailable for some reason (e.g. a
-        symbol not currently selected/visible), and to 0.0 (caller
-        must guard against this) if neither path works.
+        Dollar profit per 1 pip per given lot size, in account currency.
+        Primary: mt5.order_calc_profit() — broker's own engine.
+        Fallback: derive from trade_tick_value / trade_tick_size.
+        Emergency fallback: use self._pip_value_cache if we already
+        calibrated from a real closed position (see _calibrate_pip_value).
+        Returns 0.0 only if everything fails — caller must guard.
         """
         try:
             tick = mt5.symbol_info_tick(self.symbol)
-            if tick:
-                price = (tick.bid + tick.ask) / 2.0
-            else:
-                price = self.price
-            price_close = price + self.pip_size
+            price = (tick.bid + tick.ask) / 2.0 if tick else self.price
             profit = mt5.order_calc_profit(
-                mt5.ORDER_TYPE_BUY, self.symbol, lot, price, price_close
+                mt5.ORDER_TYPE_BUY, self.symbol, lot, price, price + self.pip_size
             )
             if profit is not None and profit > 0:
                 return float(profit)
-        except Exception as e:
-            log.warning("order_calc_profit failed for %s: %s", self.symbol, e)
+        except Exception:
+            pass
 
-        # Fallback: manual tick-value calculation.
         try:
             info = mt5.symbol_info(self.symbol)
             if info and info.trade_tick_size > 0:
-                pip_value_per_lot = (info.trade_tick_value
-                                    / info.trade_tick_size) * self.pip_size
-                return pip_value_per_lot * lot
-        except Exception as e:
-            log.warning("Tick-value pip calc failed for %s: %s", self.symbol, e)
+                return (info.trade_tick_value / info.trade_tick_size) * self.pip_size * lot
+        except Exception:
+            pass
 
+        # Last resort: use cached value from a real closed SL, normalised to lot
+        if getattr(self, '_pip_value_per_base_lot', 0.0) > 0:
+            return self._pip_value_per_base_lot * lot
         return 0.0
 
+    def _calibrate_pip_value(self, closed_dollar_loss: float, closed_lot: float):
+        """
+        Back-calculate dollar-per-pip-per-base-lot from a real SL close.
+        SL distance = 2 × dist_pips (the mirror geometry — entry to SL
+        is exactly dist from the line, same as the opposite entry, so
+        the full SL move = 2 × dist_pips in price terms).
+        Stored in _pip_value_per_base_lot so _dollar_per_pip can use it
+        as a reliable fallback even when order_calc_profit returns None.
+        """
+        sl_pips = self.dist_pips * 2
+        if sl_pips > 0 and closed_lot > 0 and closed_dollar_loss > 0:
+            self._pip_value_per_base_lot = (
+                closed_dollar_loss / sl_pips / closed_lot * self.base_lot
+            )
+            self._log(
+                f"📐  [{self.name[:20]}] pip value calibrated from real SL: "
+                f"${self._pip_value_per_base_lot:.4f}/pip/base_lot "
+                f"(loss=${closed_dollar_loss:.2f} lot={closed_lot:.2f})", "INFO"
+            )
+
     @property
-    def _balance_target_tp_pips(self) -> float:
+    def _tp_pips(self) -> float:
         """
-        TP distance in pips, sized so THIS position's TP closes the
-        remaining dollar gap to the GUI's balance-TP% goal (e.g. 10%
-        of starting balance) at the CURRENT lot size — recalculated
-        fresh every time this is read, so it naturally updates after
-        every lot-doubling (each martingale round) and after the SL
-        repositioning that happens elsewhere in this class.
+        TP distance in pips, sized to cover ALL losses accumulated so
+        far in this martingale cycle plus an equal profit on top —
+        minimum 1:2 RR (cover loss + win the same again), targeting
+        1:3 (cover loss + win 2× the total loss).
 
-        gap = (start_balance × BALANCE_TP_RATIO) − current account
-        balance. tp_pips = gap / dollar_per_pip(current_lot). As lot
-        grows each round, the SAME dollar gap needs proportionally
-        LESS price movement to close — exactly mirroring the
-        intent behind the previous inverse-RR formula, but now tied
-        to the real GUI target instead of a fixed 1:3 multiple of
-        dist_pips.
+        Formula: tp_pips = (cumulative_loss + current_sl_risk) × RR
+                           / dollar_per_pip(current_lot)
 
-        Falls back to the fixed dist_pips × 3 convention if the
-        balance target isn't configured (start_balance <= 0) or the
-        dollar-per-pip lookup fails, so a TP is always produced.
+        Where:
+          cumulative_loss   = sum of all real dollar losses closed so
+                              far in this cycle (tracked in self.cumulative_loss)
+          current_sl_risk   = what this current position would lose if
+                              its own SL is hit next
+          RR                = 3 (1:3 target; degrades to 2 if 3 would
+                              put tp_pips above a reasonable ceiling)
+          dollar_per_pip    = real broker-side pip value at current lot
+
+        Hard floor: dist_pips × 3 (the original 1:3 of the first round,
+        ensuring the very first round always has a sane minimum target).
+        Hard ceiling: none — we let the RR math determine the distance,
+        since capping it is exactly what caused the TP to never move.
         """
-        fallback_pips = self.dist_pips * 3
+        current_lot = max(self.buy_lot, self.sell_lot, self.base_lot)
+        dpp = self._dollar_per_pip(current_lot)
 
-        if self.start_balance <= 0:
-            return fallback_pips
+        # Minimum floor = dist_pips × 3, always achievable on round 1
+        floor_pips = self.dist_pips * 3
 
-        try:
-            import config as cfg
-            full_ratio = getattr(cfg, 'BALANCE_TP_RATIO', 1.10)
-            full_pct   = full_ratio - 1.0  # e.g. 0.10 for +10%
+        if dpp <= 0:
+            self._log(
+                f"⚠️  [{self.name[:20]}] _dollar_per_pip returned 0 "
+                f"(order_calc_profit unavailable?) — using floor {floor_pips}p",
+                "WARN"
+            )
+            return floor_pips
 
-            current_lot = max(self.buy_lot, self.sell_lot, self.base_lot)
-            if current_lot <= 0 or self.base_lot <= 0:
-                return fallback_pips
+        # Current round's SL risk in dollars
+        sl_pips = self.dist_pips * 2
+        current_sl_risk = dpp * sl_pips  # if this position's SL is hit next
 
-            lot_ratio = current_lot / self.base_lot  # 1, 2, 4, 8 ...
-            pct = min(0.01 * lot_ratio, full_pct)
+        total_at_risk = self.cumulative_loss + current_sl_risk
 
-            target_dollars = self.start_balance * pct
-            dollar_per_pip = self._dollar_per_pip(current_lot)
-            if dollar_per_pip <= 0:
-                return fallback_pips
+        # Try 1:3 first; if it puts TP unreasonably far (>200p) fall
+        # back to 1:2. This preserves the martingale's ability to
+        # actually recover even on deep runs.
+        for rr in (3, 2):
+            tp_pips = (total_at_risk * rr) / dpp
+            if tp_pips <= 200.0:
+                return max(tp_pips, floor_pips)
 
-            tp_pips = target_dollars / dollar_per_pip
-
-            min_tp_pips = max(self.dist_pips * 0.2, 1.0)
-            max_tp_pips = self.dist_pips * 3  # never exceed 1:3 RR
-
-            return min(max(tp_pips, min_tp_pips), max_tp_pips)
-        except Exception as e:
-            log.warning("Balance-target TP calc error: %s", e)
-            return fallback_pips
+        # Even 1:2 is > 200 pips — use 200p ceiling but never below floor
+        return max(200.0, floor_pips)
 
     @property
     def _buy_tp_price(self):
-        """
-        TP sized to close the remaining gap to the GUI's balance-TP%
-        target at the current lot size — see _balance_target_tp_pips.
-        Recalculated fresh every time this is read (every lot change/
-        SL touch reads this again via place_initial_pair / the modify-
-        lot path), so the TP line adjusts automatically each round.
-        """
-        tp_dist = self._balance_target_tp_pips * self.pip_size
+        tp_dist = self._tp_pips * self.pip_size
         return _round_price(self._buy_entry + tp_dist, self.symbol)
 
     @property
     def _sell_tp_price(self):
-        """TP sized to close the remaining balance-target gap — see
-        _balance_target_tp_pips."""
-        tp_dist = self._balance_target_tp_pips * self.pip_size
+        tp_dist = self._tp_pips * self.pip_size
         return _round_price(self._sell_entry - tp_dist, self.symbol)
 
     @property
     def _buy_r_distance(self) -> float:
-        """1R for the BUY side = distance from BUY entry to BUY's SL."""
-        return abs(self._buy_entry - self._buy_sl_price)
+        """
+        1R for the BUY side = the fixed structural distance from
+        BUY's intended entry (price + dist) to BUY's SL (price - dist)
+        = 2 × dist_pips, in price units.
+
+        IMPORTANT: this must NOT be computed from _buy_entry/_buy_sl_price
+        directly — _buy_entry now includes live spread compensation
+        (see _buy_entry), which fluctuates tick-to-tick. Using it here
+        would make R a moving target instead of the fixed risk size
+        the position was actually opened with, and could silently
+        shrink the 2R trigger threshold or report a value that
+        doesn't match what really happened. R is always exactly
+        2 × self._dist for the base class's symmetric mirror geometry.
+        """
+        return abs(2 * self._dist)
 
     @property
     def _sell_r_distance(self) -> float:
-        """1R for the SELL side = distance from SELL entry to SELL's SL."""
-        return abs(self._sell_entry - self._sell_sl_price)
+        """1R for the SELL side. See _buy_r_distance — same reasoning,
+        same fixed value (2 × self._dist) for the base class."""
+        return abs(2 * self._dist)
 
     # ── Public API ────────────────────────────────────────────────
 
@@ -307,6 +396,40 @@ class SourceState:
             return False
         if bid <= 0 or ask <= 0:
             return False
+
+        # ── Staleness check: re-relocate if price ran away and never
+        # came back to touch this auto-relocated line ────────────────
+        # Only applies to sources that got here via auto-relocate
+        # (TP win / risk-free close → fresh FVG) — never to manual
+        # lines you drew yourself, which should wait indefinitely for
+        # your line regardless of how far price has wandered.
+        if self._is_auto_relocated and self._relocated_from_price is not None:
+            mid_now = (bid + ask) / 2
+            dist_from_line_pips = abs(mid_now - self._relocated_from_price) / self.pip_size
+            age_sec = _time.time() - self._relocated_at
+
+            # Distance trigger: price ran far enough away that this
+            # FVG context is stale — a closer, fresher gap almost
+            # certainly exists now. Threshold scales with the
+            # configured order distance so it adapts to symbol/timeframe
+            # instead of a hardcoded pip count.
+            distance_trigger = dist_from_line_pips >= max(self.dist_pips * 4, 20.0)
+
+            # Time trigger: backstop for a dead/ranging market that
+            # never moves far OR close enough to either resolve —
+            # 30 minutes is long enough to not fight normal consolidation.
+            time_trigger = age_sec >= 1800
+
+            if distance_trigger or time_trigger:
+                reason = (f"price ran {dist_from_line_pips:.1f}p away"
+                         if distance_trigger else
+                         f"{age_sec/60:.0f}min with no touch")
+                self._log(
+                    f"♻️  [{self.name[:20]}] stale relocation ({reason}) — "
+                    f"finding a fresher FVG", "INFO"
+                )
+                self._relocate_to_fresh_fvg()
+                return False
 
         mid = (bid + ask) / 2
         src = self.price
@@ -362,7 +485,8 @@ class SourceState:
                     self.sell_ticket = r["ticket"]
                     self.sell_sl     = self._sell_sl_price
 
-        if self.buy_ticket or self.sell_ticket:
+        # ── Both legs placed: normal success path ──────────────────
+        if self.buy_ticket and self.sell_ticket:
             self.state = self.PENDING
             self._log(
                 f"📌  [{self.name[:20]}] R1 pair placed | "
@@ -371,8 +495,81 @@ class SourceState:
                 f"SELL#{self.sell_ticket}@{self._sell_entry:.5f} "
                 f"sl={self._sell_sl_price:.5f} lot={self.sell_lot:.2f}", "NEW"
             )
-        else:
-            self._log(f"❌  [{self.name[:20]}] failed to place initial pair", "ERROR")
+            return
+
+        # ── Neither leg placed: clean failure, stay IDLE ───────────
+        if not self.buy_ticket and not self.sell_ticket:
+            self._log(f"❌  [{self.name[:20]}] failed to place initial pair "
+                      f"(both legs failed)", "ERROR")
+            return
+
+        # ── Exactly ONE leg placed: retry the missing leg a few times
+        # before giving up. A single-leg "pair" defeats the whole
+        # martingale design (no opposite hedge to activate on
+        # recovery), so this must not be silently treated as success.
+        missing_side = "SELL_STOP" if self.buy_ticket else "BUY_STOP"
+        self._log(
+            f"⚠️  [{self.name[:20]}] {missing_side} failed to place — "
+            f"retrying ({'BUY' if self.buy_ticket else 'SELL'} leg already "
+            f"placed)", "WARN"
+        )
+
+        MAX_RETRIES = 3
+        got_missing_leg = False
+        for attempt in range(1, MAX_RETRIES + 1):
+            _time.sleep(1.0)
+            if missing_side == "SELL_STOP":
+                missing_order = {"type": "SELL_STOP", "entry": self._sell_entry,
+                                 "sl": self._sell_sl_price, "tp": self._sell_tp_price,
+                                 "lot": self.sell_lot, "source": self.price, "round": 1}
+            else:
+                missing_order = {"type": "BUY_STOP", "entry": self._buy_entry,
+                                 "sl": self._buy_sl_price, "tp": self._buy_tp_price,
+                                 "lot": self.buy_lot, "source": self.price, "round": 1}
+
+            retry_results = send_pair([missing_order], self.symbol)
+            ok = [r for r in retry_results if r["ok"]]
+            if ok:
+                if missing_side == "SELL_STOP":
+                    self.sell_ticket = ok[0]["ticket"]
+                    self.sell_sl     = self._sell_sl_price
+                else:
+                    self.buy_ticket = ok[0]["ticket"]
+                    self.buy_sl     = self._buy_sl_price
+                got_missing_leg = True
+                self._log(
+                    f"✅  [{self.name[:20]}] {missing_side} retry succeeded "
+                    f"(attempt {attempt}/{MAX_RETRIES})", "NEW"
+                )
+                break
+            self._log(
+                f"⚠️  [{self.name[:20]}] {missing_side} retry "
+                f"{attempt}/{MAX_RETRIES} failed", "WARN"
+            )
+
+        if got_missing_leg:
+            self.state = self.PENDING
+            self._log(
+                f"📌  [{self.name[:20]}] R1 pair placed (after retry) | "
+                f"BUY#{self.buy_ticket}@{self._buy_entry:.5f} "
+                f"sl={self._buy_sl_price:.5f} lot={self.buy_lot:.2f} | "
+                f"SELL#{self.sell_ticket}@{self._sell_entry:.5f} "
+                f"sl={self._sell_sl_price:.5f} lot={self.sell_lot:.2f}", "NEW"
+            )
+            return
+
+        # ── Retries exhausted: cancel the lone leg and reset cleanly,
+        # rather than running with only half a pair (no hedge at all).
+        self._log(
+            f"❌  [{self.name[:20]}] {missing_side} could not be placed "
+            f"after {MAX_RETRIES} retries — cancelling lone leg and "
+            f"resetting to IDLE", "ERROR"
+        )
+        if self.buy_ticket:
+            cancel_order(self.buy_ticket)
+        if self.sell_ticket:
+            cancel_order(self.sell_ticket)
+        self.reset()
 
     def check(self, candle: dict):
         bid = candle.get("BID", 0.0)
@@ -493,6 +690,7 @@ class SourceState:
                 pos = sorted(buy_pos, key=lambda p: p.time, reverse=True)[0]
                 self.buy_pos_ticket = pos.ticket
                 self.buy_sl         = pos.sl
+                self.buy_r_frozen   = abs(pos.price_open - pos.sl)
                 self.buy_lot        = pos.volume
                 self._buy_confirmed = True
             self.buy_ticket = None
@@ -502,6 +700,7 @@ class SourceState:
                 pos = sorted(sell_pos, key=lambda p: p.time, reverse=True)[0]
                 self.sell_pos_ticket = pos.ticket
                 self.sell_sl         = pos.sl
+                self.sell_r_frozen   = abs(pos.price_open - pos.sl)
                 self.sell_lot        = pos.volume
                 self._sell_confirmed = True
             self.sell_ticket = None
@@ -561,6 +760,7 @@ class SourceState:
                 pos = sorted(buy_pos, key=lambda p: p.time, reverse=True)[0]
                 self.buy_pos_ticket = pos.ticket
                 self.buy_sl         = pos.sl
+                self.buy_r_frozen   = abs(pos.price_open - pos.sl)
                 self.buy_lot        = pos.volume
                 self._buy_confirmed = True
                 self._log(
@@ -573,6 +773,7 @@ class SourceState:
                 pos = sorted(sell_pos, key=lambda p: p.time, reverse=True)[0]
                 self.sell_pos_ticket = pos.ticket
                 self.sell_sl         = pos.sl
+                self.sell_r_frozen   = abs(pos.price_open - pos.sl)
                 self.sell_lot        = pos.volume
                 self._sell_confirmed = True
                 self._log(
@@ -587,6 +788,7 @@ class SourceState:
                 pos = sorted(buy_pos, key=lambda p: p.time, reverse=True)[0]
                 self.buy_pos_ticket = pos.ticket
                 self.buy_sl         = pos.sl
+                self.buy_r_frozen   = abs(pos.price_open - pos.sl)
                 self.buy_lot        = pos.volume
                 self._buy_confirmed = True
                 self.buy_ticket     = None
@@ -609,6 +811,7 @@ class SourceState:
                 pos = sorted(sell_pos, key=lambda p: p.time, reverse=True)[0]
                 self.sell_pos_ticket = pos.ticket
                 self.sell_sl         = pos.sl
+                self.sell_r_frozen   = abs(pos.price_open - pos.sl)
                 self.sell_lot        = pos.volume
                 self._sell_confirmed = True
                 self.sell_ticket     = None
@@ -632,6 +835,7 @@ class SourceState:
         # gap as it shrinks/grows (lot changes, balance moves from a
         # sibling line, etc.) — see _resync_open_tp.
         self._resync_open_tp(buy_pos, sell_pos)
+        self._resync_open_sl(buy_pos, sell_pos)
 
         # ── Risk-free: move SL to lock +1R once floating profit ≥2R ─
         self._check_risk_free(buy_pos, sell_pos)
@@ -684,6 +888,12 @@ class SourceState:
                 self.reset()
                 self._relocate_to_fresh_fvg()
             else:
+                # SL hit (or unknown) — accumulate real loss and
+                # calibrate pip value from the real close, then recover.
+                real_loss = self._get_real_loss(closed_ticket)
+                if real_loss > 0:
+                    self.cumulative_loss += real_loss
+                    self._calibrate_pip_value(real_loss, self.buy_lot)
                 self._place_new_buy_stop(anchor_price=close_price)
 
         if (self.sell_pos_ticket
@@ -717,7 +927,38 @@ class SourceState:
                 self.reset()
                 self._relocate_to_fresh_fvg()
             else:
+                real_loss = self._get_real_loss(closed_ticket)
+                if real_loss > 0:
+                    self.cumulative_loss += real_loss
+                    self._calibrate_pip_value(real_loss, self.sell_lot)
                 self._place_new_sell_stop(anchor_price=close_price)
+
+    def _resync_open_sl(self, buy_pos: list, sell_pos: list):
+        """
+        Re-send TRADE_ACTION_SLTP for any open position whose live SL
+        no longer matches the opposite side's REAL current entry price
+        (_sell_entry / _buy_entry, both spread-compensated and live).
+        This is what makes BUY's SL track exactly where SELL is
+        actually sitting right now, and vice versa — the "zero gap"
+        mirror the bot is designed around. Spread moves tick to tick,
+        so this can re-send fairly often; that's accepted as the cost
+        of an exact, always-current mirror rather than a stale one.
+
+        Skipped for a side once risk-free has been applied to it —
+        from that point its SL represents the locked-in +1R profit
+        level, owned exclusively by _check_risk_free.
+        """
+        if buy_pos and not self.risk_free_applied.get("buy", False):
+            pos = sorted(buy_pos, key=lambda p: p.time, reverse=True)[0]
+            target_sl = self._buy_sl_price
+            if abs(pos.sl - target_sl) > self.pip_size * 0.9:
+                self._move_position_sl(pos.ticket, target_sl)
+
+        if sell_pos and not self.risk_free_applied.get("sell", False):
+            pos = sorted(sell_pos, key=lambda p: p.time, reverse=True)[0]
+            target_sl = self._sell_sl_price
+            if abs(pos.sl - target_sl) > self.pip_size * 0.9:
+                self._move_position_sl(pos.ticket, target_sl)
 
     def _resync_open_tp(self, buy_pos: list, sell_pos: list):
         """
@@ -741,13 +982,13 @@ class SourceState:
             # Only bother re-sending if the change is more than a
             # rounding/float-noise difference, to avoid spamming
             # order_send every single scan for a no-op change.
-            if abs(pos.tp - target_tp) > self.pip_size * 0.05:
+            if abs(pos.tp - target_tp) > self.pip_size * 0.9:
                 self._move_position_tp(pos.ticket, target_tp)
 
         if sell_pos and not self.risk_free_applied.get("sell", False):
             pos = sorted(sell_pos, key=lambda p: p.time, reverse=True)[0]
             target_tp = self._sell_tp_price
-            if abs(pos.tp - target_tp) > self.pip_size * 0.05:
+            if abs(pos.tp - target_tp) > self.pip_size * 0.9:
                 self._move_position_tp(pos.ticket, target_tp)
 
     def _move_position_tp(self, ticket: int, new_tp: float) -> bool:
@@ -784,41 +1025,92 @@ class SourceState:
     def _check_risk_free(self, buy_pos: list, sell_pos: list):
         """
         Once an open position's floating profit reaches 2R, move its
-        SL to lock in +1R instead of the original SL. R is the price
-        distance between that side's entry and its own SL at entry
-        time (computed once via _buy_r_distance/_sell_r_distance and
-        cached in risk_free_applied so this only fires once per
-        position). The opposite pending stop order is left untouched.
+        SL to lock in enough profit to cover ALL cumulative losses
+        taken so far this martingale cycle PLUS the current
+        position's own risk — not just +1R of the current round
+        alone. A flat +1R badly under-covers deep martingale runs:
+        by the time lot has doubled 6-7 times, cumulative_loss can be
+        many multiples of any single round's R, so locking only that
+        round's R leaves the cycle's real, larger loss uncovered.
+
+        2R TRIGGER (when to act) still uses the position's own frozen
+        R (self.buy_r_frozen/sell_r_frozen) — that's the right basis
+        for "has this round itself moved favorably enough to act."
+
+        LOCK-IN AMOUNT (how far to move SL) uses:
+            total_at_risk_dollars = cumulative_loss + (R in dollars
+                                    at the position's own lot)
+        converted to a price distance via the REAL dollar-per-pip at
+        the position's actual lot (mt5.order_calc_profit-based, same
+        helper the TP formula uses), so the dollar amount actually
+        locked in matches the real cumulative loss regardless of lot
+        size at this round.
+
+        R is read from self.buy_r_frozen/sell_r_frozen — frozen ONCE
+        at position-confirmation time (see _check_legs), not
+        recomputed from the live, continuously-resynced pos.sl field.
         """
+        if not self._risk_free_enabled:
+            return
         if buy_pos and not self.risk_free_applied.get("buy", False):
             pos = sorted(buy_pos, key=lambda p: p.time, reverse=True)[0]
-            r = self._buy_r_distance
+            r = self.buy_r_frozen
             if r > 0:
                 profit_dist = pos.price_current - pos.price_open
                 if profit_dist >= 2 * r:
-                    new_sl = _round_price(pos.price_open + 1 * r, self.symbol)
+                    lock_dist = self._risk_free_lock_distance(r, pos.volume)
+                    new_sl = _round_price(pos.price_open + lock_dist, self.symbol)
                     if self._move_position_sl(pos.ticket, new_sl):
                         self.risk_free_applied["buy"] = True
                         self._log(
                             f"🛡️  [{self.name[:20]}] BUY risk-free | "
                             f"profit={profit_dist:.5f} ≥ 2R={2*r:.5f} | "
-                            f"SL moved to {new_sl:.5f} (+1R locked)", "NEW"
+                            f"SL moved to {new_sl:.5f} "
+                            f"(covers cumulative_loss=${self.cumulative_loss:.2f} "
+                            f"+ this round's risk)", "NEW"
                         )
 
         if sell_pos and not self.risk_free_applied.get("sell", False):
             pos = sorted(sell_pos, key=lambda p: p.time, reverse=True)[0]
-            r = self._sell_r_distance
+            r = self.sell_r_frozen
             if r > 0:
                 profit_dist = pos.price_open - pos.price_current
                 if profit_dist >= 2 * r:
-                    new_sl = _round_price(pos.price_open - 1 * r, self.symbol)
+                    lock_dist = self._risk_free_lock_distance(r, pos.volume)
+                    new_sl = _round_price(pos.price_open - lock_dist, self.symbol)
                     if self._move_position_sl(pos.ticket, new_sl):
                         self.risk_free_applied["sell"] = True
                         self._log(
                             f"🛡️  [{self.name[:20]}] SELL risk-free | "
                             f"profit={profit_dist:.5f} ≥ 2R={2*r:.5f} | "
-                            f"SL moved to {new_sl:.5f} (+1R locked)", "NEW"
+                            f"SL moved to {new_sl:.5f} "
+                            f"(covers cumulative_loss=${self.cumulative_loss:.2f} "
+                            f"+ this round's risk)", "NEW"
                         )
+
+    def _risk_free_lock_distance(self, r_price: float, lot: float) -> float:
+        """
+        Price distance (always positive) the risk-free SL should sit
+        beyond entry, sized so the locked-in dollar profit covers
+        cumulative_loss (all real losses taken so far this cycle)
+        PLUS this round's own risk in dollars — not just a flat +1R.
+
+        total_at_risk_$ = cumulative_loss + (r_price_in_pips × $/pip)
+        lock_distance    = total_at_risk_$ / $/pip   (back to price units)
+
+        Falls back to the plain +1R distance if dollar-per-pip can't
+        be determined, so a lock is always produced.
+        """
+        dpp = self._dollar_per_pip(lot)
+        if dpp <= 0:
+            return r_price  # fallback: plain +1R in price terms
+
+        r_pips = r_price / self.pip_size
+        this_round_risk_dollars = r_pips * dpp
+        total_at_risk_dollars   = self.cumulative_loss + this_round_risk_dollars
+
+        lock_pips = total_at_risk_dollars / dpp
+        return lock_pips * self.pip_size
 
     def _move_position_sl(self, ticket: int, new_sl: float) -> bool:
         """Modify an open position's SL via TRADE_ACTION_SLTP."""
@@ -893,7 +1185,124 @@ class SourceState:
         price, _ = self._get_close_info(position_ticket)
         return price
 
+    def _get_real_loss(self, position_ticket: int) -> float:
+        """
+        Return the absolute dollar loss of a closed position from MT5
+        deal history. Returns 0.0 if the close was profitable or if
+        the deal can't be found — so it's safe to always add the
+        return value to cumulative_loss.
+        """
+        try:
+            deals = mt5.history_deals_get(position=position_ticket)
+            if not deals:
+                return 0.0
+            closing = [d for d in deals if d.entry == mt5.DEAL_ENTRY_OUT]
+            if not closing:
+                return 0.0
+            closing.sort(key=lambda d: d.time, reverse=True)
+            profit = float(closing[0].profit)
+            return abs(profit) if profit < 0 else 0.0
+        except Exception:
+            return 0.0
+
     # ── New stop placement ────────────────────────────────────────
+
+    def _max_affordable_lot(self, lot_step: float = 0.01) -> float:
+        """
+        Largest lot size (rounded down to lot_step) that passes
+        _can_afford's margin check right now. Returns 0.0 if even the
+        minimum lot isn't affordable.
+        """
+        try:
+            acct = mt5.account_info()
+            tick = mt5.symbol_info_tick(self.symbol)
+            if not acct or not tick:
+                return 0.0
+            # Margin scales ~linearly with lot for a fixed price/symbol,
+            # so compute margin-per-lot from a 1.0-lot probe and divide.
+            probe_margin = mt5.order_calc_margin(
+                mt5.ORDER_TYPE_BUY, self.symbol, 1.0, tick.ask
+            )
+            if not probe_margin or probe_margin <= 0:
+                return 0.0
+            free_margin   = acct.margin_free
+            equity        = acct.equity
+            safety_margin = equity * 0.05
+            usable_margin = free_margin - safety_margin
+            if usable_margin <= 0:
+                return 0.0
+            max_lot = usable_margin / probe_margin
+            # Round down to the nearest lot_step, floor at 0.
+            steps = int(max_lot / lot_step)
+            return max(steps * lot_step, 0.0)
+        except Exception as e:
+            log.warning("Max affordable lot calc error: %s", e)
+            return 0.0
+
+    def _has_bounce_confluence(self, is_buy: bool, current_price: float) -> bool:
+        """
+        Structural gate for deep martingale rounds: before continuing
+        to double into a losing position, check whether real market
+        structure (OB+FVG confluence) actually supports a bounce in
+        the needed direction near the current price.
+
+        This is a reasoned heuristic, NOT a calibrated probability —
+        there's no backtested statistic backing a specific win rate
+        here. It simply asks: does a genuine, currently-unmitigated
+        OB+FVG confluence zone exist within a reasonable distance of
+        price, in the direction (BULL for a BUY recovery, BEAR for a
+        SELL recovery) that would actually support the bounce this
+        round needs? If yes, the cycle continues; if no, the round
+        is treated as unsupported and the cycle resets instead of
+        blindly doubling again.
+
+        Only called once lot/margin thresholds are met — see the
+        call sites in _place_new_buy_stop/_place_new_sell_stop.
+        """
+        try:
+            from core.ob_detector import detect_order_blocks
+            from core.ob_fvg_confluence import find_confluences
+            from core.mtf_fvg import _scan_fvgs, TIMEFRAME_SPECS
+
+            obs = detect_order_blocks(
+                self.symbol, lookback=200, min_impulse_pips=3.0, swing_lookback=5
+            )
+            tick = mt5.symbol_info_tick(self.symbol)
+            if not tick:
+                return True  # can't check — fail open, don't block on a data gap
+            bid, ask = tick.bid, tick.ask
+
+            spec = TIMEFRAME_SPECS["1M"]
+            fvgs = _scan_fvgs(
+                self.symbol, "1M", spec["default_lookback"],
+                min_gap_pips=1.5, pip_size=self.pip_size, bid=bid, ask=ask
+            )
+
+            zones = find_confluences(obs, fvgs, self.pip_size)
+            if not zones:
+                return False
+
+            wanted_kind = "BULL" if is_buy else "BEAR"
+            # Reasonable proximity: within 3x the configured order
+            # distance — close enough to plausibly matter for this
+            # round's bounce, not just any zone anywhere on the chart.
+            max_dist = self.dist_pips * 3 * self.pip_size
+
+            for z in zones:
+                if z.kind != wanted_kind or z.mitigated:
+                    continue
+                zone_mid = (z.combined_top + z.combined_bottom) / 2
+                if abs(zone_mid - current_price) <= max_dist:
+                    self._log(
+                        f"✅  [{self.name[:20]}] bounce confluence found: "
+                        f"{z.summary()}", "INFO"
+                    )
+                    return True
+
+            return False
+        except Exception as e:
+            log.warning("Bounce confluence check error: %s", e)
+            return True  # fail open on any error — don't block on a bug here
 
     def _can_afford(self, lot: float, is_buy: bool) -> bool:
         try:
@@ -906,13 +1315,20 @@ class SourceState:
                 return True
             free_margin   = acct.margin_free
             equity        = acct.equity
-            safety_margin = equity * 0.20
+            # 5% cushion — enough to avoid landing right at a literal
+            # margin call after this fill, without blocking trades the
+            # account can genuinely afford. The previous 20% buffer
+            # was blocking real, affordable rounds (e.g. needing
+            # $2122 against $2445 free — actually affordable — got
+            # blocked because the 20%-of-equity cushion demanded $706
+            # left over, not because the trade itself was unaffordable).
+            safety_margin = equity * 0.05
             if free_margin - margin < safety_margin:
                 self._log(
                     f"🛡️  [{self.name[:20]}] R{self.round} MARGIN PROTECTION | "
                     f"lot={lot:.2f} needs ${margin:.2f} margin | "
                     f"free=${free_margin:.2f} equity=${equity:.2f} | "
-                    f"skipping new order — keeping existing position open", "WARN"
+                    f"cannot place safely — resetting to IDLE", "WARN"
                 )
                 return False
             return True
@@ -926,7 +1342,33 @@ class SourceState:
         self.buy_lot = max(new_buy_lot, 0.01)
 
         if not self._can_afford(self.buy_lot, is_buy=True):
-            return
+            # Full doubled lot isn't affordable — try the largest lot
+            # that IS affordable instead of abandoning the cycle.
+            # The TP/SL formulas read self.buy_lot live, so reducing
+            # it here still produces a correctly-sized TP that covers
+            # cumulative_loss + this reduced round's real risk — it's
+            # mathematically sound, just a smaller step than a full
+            # doubling would have been.
+            reduced_lot = self._max_affordable_lot()
+            if reduced_lot >= 0.01:
+                self._log(
+                    f"🛡️  [{self.name[:20]}] R{self.round} reduced lot "
+                    f"{self.buy_lot:.2f} → {reduced_lot:.2f} (margin-limited) — "
+                    f"keeping the cycle alive toward the original target", "WARN"
+                )
+                self.buy_lot = reduced_lot
+            else:
+                # Even the minimum lot isn't affordable — nothing left
+                # to try. Reset cleanly rather than leaving the source
+                # dangling with no position and no pending order.
+                self._log(
+                    f"🛡️  [{self.name[:20]}] R{self.round} MARGIN PROTECTION | "
+                    f"not even minimum lot is affordable — resetting to IDLE", "WARN"
+                )
+                self.needs_full_reset = True
+                self.reset()
+                self._relocate_to_fresh_fvg()
+                return
 
         # Re-anchor from the EXACT price the previous BUY position's
         # SL closed at (rather than the original fixed line/zone
@@ -936,6 +1378,34 @@ class SourceState:
         # their own re-anchoring logic.
         if anchor_price is not None:
             self._reanchor_buy(anchor_price)
+
+        # ── Structural gate for deep rounds ─────────────────────────
+        # Once lot has grown large (≥0.64) OR free margin is getting
+        # tight, don't just blindly double again — require real OB+FVG
+        # confluence supporting a bounce. If neither condition is met,
+        # this is a no-op (cheap checks only, no detector calls).
+        deep_round = self.buy_lot >= 0.64
+        tight_margin = False
+        if not deep_round:
+            try:
+                acct = mt5.account_info()
+                if acct and acct.equity > 0:
+                    tight_margin = (acct.margin_free / acct.equity) < 0.30
+            except Exception:
+                pass
+
+        if deep_round or tight_margin:
+            mid_now = (self._last_bid + self._last_ask) / 2 if self._last_ask else self.price
+            if not self._has_bounce_confluence(is_buy=True, current_price=mid_now):
+                self._log(
+                    f"🚫  [{self.name[:20]}] R{self.round} no bounce confluence "
+                    f"found (lot={self.buy_lot:.2f}) — cutting losses, "
+                    f"resetting instead of doubling again", "WARN"
+                )
+                self.needs_full_reset = True
+                self.reset()
+                self._relocate_to_fresh_fvg()
+                return
 
         order = {"type": "BUY_STOP", "entry": self._buy_entry,
                  "sl": self._buy_sl_price, "tp": self._buy_tp_price,
@@ -965,12 +1435,51 @@ class SourceState:
         self.sell_lot = max(new_sell_lot, 0.01)
 
         if not self._can_afford(self.sell_lot, is_buy=False):
-            return
+            reduced_lot = self._max_affordable_lot()
+            if reduced_lot >= 0.01:
+                self._log(
+                    f"🛡️  [{self.name[:20]}] R{self.round} reduced lot "
+                    f"{self.sell_lot:.2f} → {reduced_lot:.2f} (margin-limited) — "
+                    f"keeping the cycle alive toward the original target", "WARN"
+                )
+                self.sell_lot = reduced_lot
+            else:
+                self._log(
+                    f"🛡️  [{self.name[:20]}] R{self.round} MARGIN PROTECTION | "
+                    f"not even minimum lot is affordable — resetting to IDLE", "WARN"
+                )
+                self.needs_full_reset = True
+                self.reset()
+                self._relocate_to_fresh_fvg()
+                return
 
         # Re-anchor from the EXACT price the previous SELL position's
         # SL closed at — see matching comment in _place_new_buy_stop.
         if anchor_price is not None:
             self._reanchor_sell(anchor_price)
+
+        deep_round = self.sell_lot >= 0.64
+        tight_margin = False
+        if not deep_round:
+            try:
+                acct = mt5.account_info()
+                if acct and acct.equity > 0:
+                    tight_margin = (acct.margin_free / acct.equity) < 0.30
+            except Exception:
+                pass
+
+        if deep_round or tight_margin:
+            mid_now = (self._last_bid + self._last_ask) / 2 if self._last_ask else self.price
+            if not self._has_bounce_confluence(is_buy=False, current_price=mid_now):
+                self._log(
+                    f"🚫  [{self.name[:20]}] R{self.round} no bounce confluence "
+                    f"found (lot={self.sell_lot:.2f}) — cutting losses, "
+                    f"resetting instead of doubling again", "WARN"
+                )
+                self.needs_full_reset = True
+                self.reset()
+                self._relocate_to_fresh_fvg()
+                return
 
         order = {"type": "SELL_STOP", "entry": self._sell_entry,
                  "sl": self._sell_sl_price, "tp": self._sell_tp_price,
@@ -1089,11 +1598,15 @@ class SourceState:
         self.sell_lot        = self.base_lot
         self.buy_sl          = None
         self.sell_sl         = None
+        self.buy_r_frozen    = 0.0
+        self.sell_r_frozen   = 0.0
         self.round           = 0
         self.state           = self.IDLE
         self._buy_confirmed  = False
         self._sell_confirmed = False
         self.risk_free_applied = {"buy": False, "sell": False}
+        self.cumulative_loss   = 0.0
+        self._pip_value_per_base_lot = 0.0
         self._log(f"🔄  [{self.name[:20]}] state reset to IDLE")
         try:
             from core.resume import clear_session
@@ -1179,6 +1692,8 @@ class SourceState:
             self.last_prev_t   = 0
             self.registered_at = 0
             self._is_auto_relocated = True
+            self._relocated_at = _time.time()
+            self._relocated_from_price = new_price
 
             self._log(
                 f"🆕  [{old_name[:20]}] auto-relocated {old_price:.5f} → "

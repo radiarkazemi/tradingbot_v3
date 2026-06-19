@@ -66,22 +66,27 @@ class FVGEntryState(SourceState):
 
     @property
     def _buy_entry(self):
-        return _round_price(self.fvg_top - self._dist, self.symbol)
+        raw = _round_price(self.fvg_top - self._dist, self.symbol)
+        return _round_price(raw - self._current_spread(), self.symbol)
 
     @property
     def _sell_entry(self):
-        return _round_price(self.fvg_bottom + self._dist, self.symbol)
+        raw = _round_price(self.fvg_bottom + self._dist, self.symbol)
+        return _round_price(raw + self._current_spread(), self.symbol)
 
     @property
     def _buy_sl_price(self):
-        # Self-mirrored around BUY's own entry, NOT tied to the zone
-        # bottom: SL = entry - 2*dist = top - 3*dist
+        # Self-mirrored: SL = BUY's own real entry minus 2×dist.
+        # Using self._buy_entry directly (already spread-compensated)
+        # instead of recomputing the raw intended level keeps the
+        # self-mirror exact and spread-accurate — without this, SL
+        # stayed at the pre-spread level while entry moved by the
+        # spread, breaking the mirror by exactly that amount.
         return _round_price(self._buy_entry - 2 * self._dist, self.symbol)
 
     @property
     def _sell_sl_price(self):
-        # Self-mirrored around SELL's own entry: SL = entry + 2*dist
-        # = bottom + 3*dist
+        # Self-mirrored: SL = SELL's own real entry plus 2×dist.
         return _round_price(self._sell_entry + 2 * self._dist, self.symbol)
 
     # ── Re-anchoring on SL close ─────────────────────────────────────

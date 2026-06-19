@@ -199,14 +199,16 @@ class WatcherSignals:
 class WatcherThread(threading.Thread):
 
     def __init__(self, symbol: str, lot_size: float,
-                 follow_enabled: bool = True, resume_enabled: bool = False):
+                 follow_enabled: bool = True, resume_enabled: bool = False,
+                 risk_free_enabled: bool = False):
         super().__init__(daemon=True)
-        self.symbol          = symbol
-        self.lot_size        = lot_size
-        self.follow_enabled  = follow_enabled
-        self._resume_enabled = resume_enabled
-        self.sig             = WatcherSignals()
-        self._stop_event     = threading.Event()
+        self.symbol             = symbol
+        self.lot_size           = lot_size
+        self.follow_enabled     = follow_enabled
+        self._resume_enabled    = resume_enabled
+        self._risk_free_enabled = risk_free_enabled
+        self.sig                = WatcherSignals()
+        self._stop_event        = threading.Event()
         self._sources: dict[str, SourceState] = {}
         self._seen:    set = set()
         self._skipped: set = set()
@@ -214,6 +216,22 @@ class WatcherThread(threading.Thread):
         # Grace period: name → consecutive absent-scan count.
         # Line must be missing REMOVAL_GRACE scans before we reset it.
         self._missing_counts: dict[str, int] = {}
+
+    def set_risk_free_enabled(self, enabled: bool):
+        """
+        Update the risk-free flag live, while the bot is running.
+        Propagates immediately to every currently-tracked SourceState
+        (new sources created after this call already pick up the
+        updated self._risk_free_enabled at construction time, see the
+        SourceState(...) call further down in the scan loop).
+        """
+        self._risk_free_enabled = enabled
+        for state in self._sources.values():
+            state._risk_free_enabled = enabled
+        self.log(
+            f"🛡️  Risk-Free {'ENABLED' if enabled else 'DISABLED'} "
+            f"({len(self._sources)} active source(s) updated)"
+        )
 
     def stop(self):
         self._stop_event.set()
@@ -407,15 +425,16 @@ class WatcherThread(threading.Thread):
 
                     if src is not None:
                         state = SourceState(
-                            name          = n,
-                            price         = src,
-                            pip_size      = pip,
-                            symbol        = self.symbol,
-                            base_lot      = self.lot_size,
-                            dist_pips     = dist_pips,
-                            start_balance = self._start_balance,
-                            log_fn        = self.log,
-                            stop_fn       = self._on_balance_tp,
+                            name              = n,
+                            price             = src,
+                            pip_size          = pip,
+                            symbol            = self.symbol,
+                            base_lot          = self.lot_size,
+                            dist_pips         = dist_pips,
+                            start_balance     = self._start_balance,
+                            log_fn            = self.log,
+                            stop_fn           = self._on_balance_tp,
+                            risk_free_enabled = self._risk_free_enabled,
                         )
                         state.registered_at = cur_t
                         state.last_prev_t   = prev_t
@@ -469,6 +488,34 @@ class WatcherThread(threading.Thread):
                         self._seen.discard(old_n)
                         self._seen.add(new_n)
                         self._missing_counts.pop(old_n, None)
+
+                        # Also remove the original chart-object-backed
+                        # source (the line you placed manually on the
+                        # first run). Now that the bot has auto-relocated
+                        # to a fresh FVG, that original line can no longer
+                        # serve as a useful entry signal — and if it ends
+                        # up near the relocated price, both sources would
+                        # fire independently and place duplicate pairs.
+                        # original_chart_name is the key it had BEFORE the
+                        # rename (set once in __init__, never changed).
+                        orig = getattr(st, "original_chart_name", None)
+                        if orig and orig != new_n and orig in self._sources:
+                            orig_state = self._sources[orig]
+                            # Only remove it if it's idle (no open orders
+                            # or positions) — if it has an active cycle
+                            # running, leave it alone; that cycle must
+                            # complete naturally.
+                            is_idle = (getattr(orig_state, "state", None)
+                                       == orig_state.IDLE
+                                       if orig_state else True)
+                            if is_idle:
+                                del self._sources[orig]
+                                self._seen.discard(orig)
+                                self._missing_counts.pop(orig, None)
+                                self.log(
+                                    f"🗑️  [{orig[:25]}] original line retired "
+                                    f"— bot auto-relocated to fresh FVG"
+                                )
 
                 # ── Moved lines ───────────────────────────────────
                 if self.follow_enabled:

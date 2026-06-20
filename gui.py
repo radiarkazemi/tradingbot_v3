@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QProgressBar, QCheckBox, QScrollArea, QLineEdit,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtGui import QColor, QFont, QPainter, QPainterPath, QLinearGradient, QPen
 
 os.makedirs("logs", exist_ok=True)
 
@@ -138,6 +138,141 @@ def _hline():
     f = QFrame(); f.setFrameShape(QFrame.HLine)
     f.setStyleSheet(f"color:{C['border']};"); return f
 
+
+class Sparkline(QWidget):
+    """
+    Tiny embedded real-time line chart — no extra dependencies, just
+    QPainter. Fed live equity samples from the existing 3-second
+    refresh timer; draws a smooth filled trend line that's green when
+    the visible window is trending up, red when trending down. Gives
+    an at-a-glance read on account trajectory without needing a
+    separate chart window.
+    """
+    def __init__(self, max_points: int = 80, parent=None):
+        super().__init__(parent)
+        self._values = []
+        self._max_points = max_points
+        self.setMinimumHeight(46)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def add_value(self, v: float):
+        self._values.append(v)
+        if len(self._values) > self._max_points:
+            self._values.pop(0)
+        self.update()
+
+    def clear(self):
+        self._values = []
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        if len(self._values) < 2:
+            painter.setPen(QColor(C['txt3']))
+            painter.drawText(self.rect(), Qt.AlignCenter, "— waiting for live data —")
+            return
+        vmin, vmax = min(self._values), max(self._values)
+        if vmax - vmin < 1e-9:
+            vmax = vmin + 1.0
+        rising = self._values[-1] >= self._values[0]
+        color = QColor(C['green']) if rising else QColor(C['red'])
+        n = len(self._values)
+        pad = 4
+
+        def pt(i, v):
+            x = pad + (w - 2 * pad) * (i / (n - 1))
+            y = h - pad - (h - 2 * pad) * ((v - vmin) / (vmax - vmin))
+            return x, y
+
+        path = QPainterPath()
+        x0, y0 = pt(0, self._values[0])
+        path.moveTo(x0, y0)
+        for i, v in enumerate(self._values[1:], start=1):
+            x, y = pt(i, v)
+            path.lineTo(x, y)
+
+        fill_path = QPainterPath(path)
+        xl, _ = pt(n - 1, self._values[-1])
+        fill_path.lineTo(xl, h - pad)
+        fill_path.lineTo(x0, h - pad)
+        fill_path.closeSubpath()
+        grad = QLinearGradient(0, 0, 0, h)
+        top = QColor(color); top.setAlpha(90)
+        bottom = QColor(color); bottom.setAlpha(0)
+        grad.setColorAt(0, top)
+        grad.setColorAt(1, bottom)
+        painter.fillPath(fill_path, grad)
+
+        painter.setPen(QPen(color, 1.6))
+        painter.drawPath(path)
+
+
+class PulseDot(QLabel):
+    """
+    Small glowing status indicator — breathes (alternates brightness)
+    while the bot is running, sits dim/static gray when stopped,
+    glows steady red on a warning/error state. Pure QSS + QTimer.
+    """
+    def __init__(self, parent=None):
+        super().__init__("●", parent)
+        self._mode = "stopped"
+        self._phase = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._apply_static(C['txt3'])
+
+    def _apply_static(self, color_hex: str):
+        self.setStyleSheet(f"color:{color_hex};font-size:15px;")
+
+    def set_mode(self, mode: str):
+        """mode: 'running' | 'stopped' | 'starting' | 'error'"""
+        if mode == self._mode:
+            return
+        self._mode = mode
+        if mode in ("running", "starting"):
+            self._timer.start(450 if mode == "running" else 220)
+            self._tick()  # paint the bright frame immediately, don't
+                           # wait for the first timer interval to elapse
+        else:
+            self._timer.stop()
+            self._apply_static(C['red'] if mode == "error" else C['txt3'])
+
+    def _tick(self):
+        self._phase = (self._phase + 1) % 2
+        bright = C['green'] if self._mode == "running" else C['gold']
+        dim    = "#0a4a2e" if self._mode == "running" else "#5c4400"
+        self._apply_static(bright if self._phase == 0 else dim)
+
+
+def _stat_card(title: str, accent_color: str, big: bool = False):
+    """
+    Builds a small KPI "card" — colored top accent bar, a faint
+    uppercase title, and a large bold value label. Returns
+    (card_frame, value_label) — the caller keeps the value_label
+    reference to update text on it; everything else is just chrome.
+    """
+    card = QFrame()
+    card.setStyleSheet(
+        f"QFrame {{ background:{C['input']}; border:1px solid {C['border']}; "
+        f"border-top:2px solid {accent_color}; border-radius:5px; }}"
+    )
+    cl = QVBoxLayout(card)
+    cl.setContentsMargins(10, 6, 10, 8)
+    cl.setSpacing(2)
+    title_lbl = QLabel(title.upper())
+    title_lbl.setStyleSheet(
+        f"color:{C['txt3']};font-size:9px;font-weight:bold;letter-spacing:1px;border:none;")
+    cl.addWidget(title_lbl)
+    value_lbl = QLabel("—")
+    size = 16 if big else 13
+    value_lbl.setStyleSheet(
+        f"color:{C['txt']};font-family:Consolas;font-size:{size}px;"
+        f"font-weight:bold;border:none;")
+    cl.addWidget(value_lbl)
+    return card, value_lbl
+
 # ── Main Window ───────────────────────────────────────────────────
 class GUI(QMainWindow):
 
@@ -145,6 +280,7 @@ class GUI(QMainWindow):
         super().__init__()
         self.setWindowTitle("TraderBot v2 — 2-Order Martingale")
         self.setMinimumSize(860, 640)
+        self.resize(1180, 800)
         self.setStyleSheet(SS)
 
         self._worker:            Optional[WatcherThread]     = None
@@ -229,6 +365,8 @@ class GUI(QMainWindow):
         self.lbl_ea_status.setToolTip("ObjectExporter EA file status")
         hl.addWidget(self.lbl_ea_status)
         hl.addWidget(_vline())
+        self.pulse_dot = PulseDot()
+        hl.addWidget(self.pulse_dot)
         self.lbl_status = QLabel("⚫  Stopped")
         self.lbl_status.setStyleSheet(f"color:{C['txt2']};font-size:11px;")
         hl.addWidget(self.lbl_status)
@@ -243,6 +381,18 @@ class GUI(QMainWindow):
         w = QWidget(); vl = QVBoxLayout(w)
         vl.setSpacing(8); vl.setContentsMargins(0, 0, 4, 0)
         scroll.setWidget(w)
+
+        # Two tabs instead of one long stacked column of 9 group
+        # boxes: "Control" for everything needed day-to-day (start/
+        # stop, balance, active lines, emergency), "Detectors" for
+        # the chart-pattern settings (FVG/OB/Confluence/MTF/AMD) that
+        # are configured occasionally and don't need to be visible
+        # while just watching the bot run.
+        left_tabs = QTabWidget()
+        page_control = QWidget()
+        cv = QVBoxLayout(page_control); cv.setSpacing(8); cv.setContentsMargins(2, 6, 2, 2)
+        page_detectors = QWidget()
+        dv = QVBoxLayout(page_detectors); dv.setSpacing(8); dv.setContentsMargins(2, 6, 2, 2)
 
         def _lbl(text, tip=""):
             l = QLabel(text); l.setStyleSheet(f"color:{C['txt2']};font-size:11px;")
@@ -291,6 +441,17 @@ class GUI(QMainWindow):
              "Each position's own TP ramps from 1% at base lot, "
              "doubling with lot size, capped at this %.")
 
+        self.combo_capital_mode = QComboBox()
+        self.combo_capital_mode.addItems(["Custom", "Soft", "Aggressive"])
+        self.combo_capital_mode.setCurrentText("Custom")
+        _row("⚖️ Capital Mode:", self.combo_capital_mode, cl,
+             "Soft: smaller lot growth, earlier risk-free, tighter "
+             "hard stop-loss (10% drawdown) — trades upside for "
+             "safety.\nAggressive: full lot doubling, later "
+             "risk-free, looser hard stop (30% drawdown) — closer "
+             "to the original unprotected behavior.\nCustom: use "
+             "whatever is set in config.py as-is.")
+
         self.chk_follow = QCheckBox("Follow moved lines")
         self.chk_follow.setChecked(True)
         self.chk_follow.setToolTip(
@@ -319,6 +480,40 @@ class GUI(QMainWindow):
 
         cl.addWidget(_hline())
 
+        self.chk_backtest = QCheckBox("🧪  Backtest Mode (simulated, no live MT5)")
+        self.chk_backtest.setChecked(False)
+        self.chk_backtest.setToolTip(
+            "Runs against a synthetic random-walk price path and a\n"
+            "mock broker instead of your live MT5 terminal — no chart\n"
+            "or EA needed. Tests the recovery/risk machinery (lot\n"
+            "growth, risk-free, margin gates, hard stop-loss) under\n"
+            "generic volatility. Results print to the terminal you\n"
+            "launched gui.py from.")
+        self.chk_backtest.setStyleSheet(f"color:{C['purple']};font-weight:bold;")
+        self.chk_backtest.toggled.connect(self._on_backtest_toggled)
+        cl.addWidget(self.chk_backtest)
+
+        self.spin_backtest_days = QSpinBox()
+        self.spin_backtest_days.setRange(1, 90)
+        self.spin_backtest_days.setValue(10)
+        self.spin_backtest_days.setSuffix(" days")
+        self.spin_backtest_days.setEnabled(False)
+        _row("📅 Backtest length:", self.spin_backtest_days, cl,
+             "Number of simulated trading days to run")
+
+        self.spin_backtest_seed = QSpinBox()
+        self.spin_backtest_seed.setRange(-1, 999999)
+        self.spin_backtest_seed.setValue(-1)
+        self.spin_backtest_seed.setEnabled(False)
+        _row("🎲 Seed (-1=random):", self.spin_backtest_seed, cl,
+             "Set a specific number to reproduce the exact same "
+             "simulated price path again. -1 = a new random path "
+             "every run (this is why results differ each time by "
+             "default — there's no historical data to replay, it's "
+             "a fresh synthetic path unless you fix the seed here).")
+
+        cl.addWidget(_hline())
+
         self.btn_start = QPushButton("▶  Start Watcher")
         self.btn_start.setObjectName("btn_start")
         self.btn_start.setMinimumHeight(38)
@@ -332,7 +527,7 @@ class GUI(QMainWindow):
         self.btn_stop.clicked.connect(self._stop)
         cl.addWidget(self.btn_stop)
 
-        vl.addWidget(grp_ctrl)
+        cv.addWidget(grp_ctrl)
 
         # ── Active Sequences group ────────────────────────────────
         grp_seq = QGroupBox("🔥  Active Sequences")
@@ -342,18 +537,36 @@ class GUI(QMainWindow):
             f"color:{C['txt2']};font-size:11px;font-family:Consolas;")
         self.lbl_sequences.setWordWrap(True)
         sl.addWidget(self.lbl_sequences)
-        vl.addWidget(grp_seq)
+        cv.addWidget(grp_seq)
 
         # ── Balance TP progress ───────────────────────────────────
         grp_bal = QGroupBox("💰  Balance Progress")
-        bl = QVBoxLayout(grp_bal); bl.setSpacing(4)
-        self.lbl_balance = QLabel("Balance: —")
-        self.lbl_balance.setStyleSheet(f"color:{C['gold']};font-family:Consolas;font-size:11px;")
-        bl.addWidget(self.lbl_balance)
-        self.lbl_balance_target = QLabel("Target: —")
-        self.lbl_balance_target.setStyleSheet(f"color:{C['txt2']};font-size:10px;")
-        bl.addWidget(self.lbl_balance_target)
-        vl.addWidget(grp_bal)
+        bl = QVBoxLayout(grp_bal); bl.setSpacing(8)
+
+        row1 = QHBoxLayout(); row1.setSpacing(6)
+        card_bal, self.lbl_balance = _stat_card("Balance", C['gold'], big=True)
+        card_tgt, self.lbl_balance_target = _stat_card("Target", C['cyan'])
+        row1.addWidget(card_bal)
+        row1.addWidget(card_tgt)
+        bl.addLayout(row1)
+
+        row2 = QHBoxLayout(); row2.setSpacing(6)
+        card_net, self.lbl_net_profit = _stat_card("Net Profit", C['green'])
+        card_pnl, self.lbl_total_pnl_all = _stat_card("Total PnL", C['blue'])
+        card_dd, self.lbl_loss_pct = _stat_card("Drawdown", C['red'])
+        row2.addWidget(card_net)
+        row2.addWidget(card_pnl)
+        row2.addWidget(card_dd)
+        bl.addLayout(row2)
+
+        self.sparkline = Sparkline()
+        self.sparkline.setToolTip(
+            "Live equity trend (last ~4 minutes of refreshes). "
+            "Green = trending up, red = trending down over the "
+            "visible window.")
+        bl.addWidget(self.sparkline)
+
+        cv.addWidget(grp_bal)
 
         # ── FVG Settings group ────────────────────────────────────
         grp_fvg = QGroupBox("📐  Fair Value Gaps (FVG)")
@@ -416,7 +629,7 @@ class GUI(QMainWindow):
             f"color:{C['cyan']};font-family:Consolas;font-size:10px;")
         fv.addWidget(self.lbl_fvg_count)
 
-        vl.addWidget(grp_fvg)
+        dv.addWidget(grp_fvg)
 
         # ── OB Settings group ─────────────────────────────────────
         grp_ob = QGroupBox("🟦  Order Blocks (OB)")
@@ -503,7 +716,7 @@ class GUI(QMainWindow):
             f"color:{C['aqua']};font-family:Consolas;font-size:10px;")
         ov.addWidget(self.lbl_ob_count)
 
-        vl.addWidget(grp_ob)
+        dv.addWidget(grp_ob)
 
         # ── Confluence Settings ───────────────────────────────────
         grp_conf = QGroupBox("🟡  OB + FVG Confluence")
@@ -577,7 +790,7 @@ class GUI(QMainWindow):
             f"color:{C['yellow']};font-family:Consolas;font-size:10px;")
         cv.addWidget(self.lbl_conf_count)
 
-        vl.addWidget(grp_conf)
+        dv.addWidget(grp_conf)
 
         # ── Cancel All group ──────────────────────────────────────
         grp_cancel = QGroupBox("🛑  Emergency")
@@ -587,7 +800,7 @@ class GUI(QMainWindow):
         self.btn_cancel_all.setMinimumHeight(30)
         self.btn_cancel_all.clicked.connect(self._cancel_all)
         ecl.addWidget(self.btn_cancel_all)
-        vl.addWidget(grp_cancel)
+        cv.addWidget(grp_cancel)
 
 
 
@@ -698,7 +911,7 @@ class GUI(QMainWindow):
             f"color:{C['gold']};font-family:Consolas;font-size:10px;")
         mv.addWidget(self.lbl_mtf_count)
 
-        vl.addWidget(grp_mtf)
+        dv.addWidget(grp_mtf)
 
         # ── AMD Quarter Theory ────────────────────────────────────
         grp_amd = QGroupBox("🟩  AMD Quarter Theory")
@@ -759,9 +972,13 @@ class GUI(QMainWindow):
         self.lbl_amd_status.setWordWrap(True)
         av.addWidget(self.lbl_amd_status)
 
-        vl.addWidget(grp_amd)
+        dv.addWidget(grp_amd)
 
-        vl.addStretch()
+        cv.addStretch()
+        dv.addStretch()
+        left_tabs.addTab(page_control, "🎮 Control")
+        left_tabs.addTab(page_detectors, "📐 Detectors")
+        vl.addWidget(left_tabs)
         return scroll
 
     # ── Right Panel ───────────────────────────────────────────────
@@ -911,6 +1128,7 @@ class GUI(QMainWindow):
         sym    = self.sym_combo.currentText().strip() or WATCH_SYMBOL
         lot    = self.spin_lot.value()
         follow = self.chk_follow.isChecked()
+        self.sparkline.clear()
 
         import config as cfg
         cfg.ORDER_DISTANCE_PIPS = self.spin_dist.value()
@@ -918,7 +1136,45 @@ class GUI(QMainWindow):
         cfg.TP_RR_RATIO         = 0.0
         cfg.BALANCE_TP_RATIO    = 1.0 + self.spin_balance_tp.value() / 100.0
 
+        mode = self.combo_capital_mode.currentText()
+        if mode != "Custom":
+            cfg.apply_capital_mode(mode)
+            self._sig.log_line.emit(
+                f"⚖️  Capital Mode: {mode} — "
+                f"LOT_MULTIPLIER={cfg.LOT_MULTIPLIER}, "
+                f"RISK_FREE_TRIGGER_R={cfg.RISK_FREE_TRIGGER_R}, "
+                f"HARD_STOP_LOSS_RATIO={cfg.HARD_STOP_LOSS_RATIO}", "INFO"
+            )
+
         self.lbl_sym_hdr.setText(sym)
+
+        if self.chk_backtest.isChecked():
+            from core.backtest_engine import BacktestThread
+            days = self.spin_backtest_days.value()
+            seed_val = self.spin_backtest_seed.value()
+            seed = None if seed_val < 0 else seed_val
+            self._sig.log_line.emit(
+                f"🧪  Starting backtest: {sym}, {days} simulated days "
+                f"(seed={'random' if seed is None else seed}) "
+                f"— watch this terminal for the results.", "NEW"
+            )
+            self._worker = BacktestThread(
+                symbol            = sym,
+                lot_size          = lot,
+                dist_pips         = self.spin_dist.value(),
+                risk_free_enabled = self.chk_risk_free.isChecked(),
+                days              = days,
+                start_balance     = 1000.0,
+                seed              = seed,
+            )
+            self._worker.sig.on_log(    lambda m, l: self._sig.log_line.emit(m, l))
+            self._worker.sig.on_stop(   lambda:      self._sig.balance_tp.emit())
+            self._worker.start()
+
+            self.btn_start.setEnabled(False)
+            self.btn_stop.setEnabled(True)
+            self._on_status("🧪  Running backtest…")
+            return
 
         self._worker = WatcherThread(
             symbol            = sym,
@@ -1177,6 +1433,14 @@ class GUI(QMainWindow):
 
     def _on_status(self, msg: str):
         self.lbl_status.setText(msg)
+        if "🟢" in msg or "🧪" in msg:
+            self.pulse_dot.set_mode("running")
+        elif "⚠️" in msg or "❌" in msg:
+            self.pulse_dot.set_mode("error")
+        elif "🟡" in msg or "⏳" in msg:
+            self.pulse_dot.set_mode("starting")
+        else:
+            self.pulse_dot.set_mode("stopped")
 
     def _on_state(self, states: list):
         counts = {SourceState.IDLE: 0, SourceState.PENDING: 0,
@@ -1324,12 +1588,57 @@ class GUI(QMainWindow):
                 profit = acct.balance - start_bal
                 profit_color = C['green'] if profit >= 0 else C['red']
                 self.lbl_balance.setText(
-                    f"Balance: {acct.balance:.2f}  "
-                    f"<span style='color:{profit_color};'>({profit:+.2f})</span>"
+                    f"<span style='color:{C['gold']};'>{acct.balance:,.2f}</span>"
                 )
-                self.lbl_balance_target.setText(
-                    f"Start: {start_bal:.2f}  Target: {target:.2f}  (+{pct:.0f}%)"
+                self.lbl_balance.setToolTip(f"Net change: {profit:+.2f}")
+                self.lbl_balance_target.setText(f"{target:,.2f}")
+                self.lbl_balance_target.setToolTip(
+                    f"Start: {start_bal:.2f}  (+{pct:.0f}% target)")
+
+                # ── Net profit (realized only — balance vs session start) ──
+                net_color = C['green'] if profit >= 0 else C['red']
+                self.lbl_net_profit.setText(
+                    f"<span style='color:{net_color};'>{profit:+,.2f}</span>"
                 )
+
+                # ── Total PnL = realized + currently-open floating PnL.
+                # acct.equity already = balance + floating PnL, so
+                # equity - start_bal gives the true all-in PnL figure
+                # without double-counting the open positions' profit.
+                total_pnl_all = acct.equity - start_bal
+                tpnl_color = C['green'] if total_pnl_all >= 0 else C['red']
+                self.lbl_total_pnl_all.setText(
+                    f"<span style='color:{tpnl_color};'>{total_pnl_all:+,.2f}</span>"
+                )
+
+                self.sparkline.add_value(acct.equity)
+
+                # ── Drawdown % — how far below session-start balance the
+                # account currently sits (equity-based, so it reflects
+                # open losing positions too, not just closed ones). This
+                # is the same basis HARD_STOP_LOSS_RATIO checks against,
+                # so this number tells you how close to the kill switch
+                # you are in real time.
+                if start_bal > 0:
+                    drawdown_pct = (start_bal - acct.equity) / start_bal * 100.0
+                else:
+                    drawdown_pct = 0.0
+                try:
+                    import config as _cfg
+                    hard_stop_pct = (1.0 - getattr(
+                        _cfg, "HARD_STOP_LOSS_RATIO", 0.80)) * 100.0
+                except Exception:
+                    hard_stop_pct = 20.0
+                if drawdown_pct > 0:
+                    dd_color = C['red'] if drawdown_pct >= hard_stop_pct * 0.75 else C['orange']
+                    self.lbl_loss_pct.setText(
+                        f"<span style='color:{dd_color};'>-{drawdown_pct:.1f}%</span>"
+                    )
+                else:
+                    self.lbl_loss_pct.setText(
+                        f"<span style='color:{C['green']};'>0.0%</span>"
+                    )
+                self.lbl_loss_pct.setToolTip(f"Kill switch at -{hard_stop_pct:.0f}%")
         except Exception:
             pass
 
@@ -1396,6 +1705,23 @@ class GUI(QMainWindow):
             log_fn          = lambda m, l="INFO": self._sig.log_line.emit(m, l),
         )
         self._amd_worker.start()
+
+    def _on_backtest_toggled(self, checked: bool):
+        """
+        Backtest Mode runs against a synthetic price path with no
+        chart and no live MT5 connection — the FVG/OB/AMD/MTF chart
+        detectors have nothing real to read in this mode, so disable
+        and uncheck them to avoid implying they'll do anything.
+        """
+        self.spin_backtest_days.setEnabled(checked)
+        self.spin_backtest_seed.setEnabled(checked)
+        for chk in (self.chk_fvg, self.chk_ob, self.chk_mtf, self.chk_amd,
+                    self.chk_confluence, self.chk_resume, self.chk_follow):
+            chk.setEnabled(not checked)
+            if checked:
+                chk.setChecked(False)
+        self.btn_start.setText(
+            "▶  Run Backtest" if checked else "▶  Start Watcher")
 
     def _on_risk_free_toggled(self, checked: bool):
         """

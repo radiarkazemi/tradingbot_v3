@@ -22,10 +22,25 @@ def _filling_mode(symbol: str) -> int:
 
 
 def _min_stop_dist(symbol: str) -> float:
+    """
+    Minimum allowed distance for SL/TP from entry, in price units.
+    Broker-side floor (trade_stops_level × point × 1.5) plus an
+    explicit SLIPPAGE_BUFFER_PIPS on top — the broker's number is the
+    bare minimum it will accept; ordinary slippage on a fill can still
+    push a placement that's only just past that minimum into outright
+    rejection, so this adds real headroom rather than skating the line.
+    """
     info = mt5.symbol_info(symbol)
     if info is None:
         return 0.0
-    return info.trade_stops_level * info.point * 1.5
+    broker_floor = info.trade_stops_level * info.point * 1.5
+    try:
+        from config import SLIPPAGE_BUFFER_PIPS
+        pip_size = get_pip_size(symbol)
+        broker_floor += SLIPPAGE_BUFFER_PIPS * pip_size
+    except Exception:
+        pass
+    return broker_floor
 
 
 def _round_price(price: float, symbol: str) -> float:

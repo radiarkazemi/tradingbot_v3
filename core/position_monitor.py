@@ -37,7 +37,7 @@ def _save(state):
 
 log = logging.getLogger("monitor_v2")
 
-ACTIVATION_GRACE_SEC = 5
+import config as cfg
 
 
 class SourceState:
@@ -54,11 +54,29 @@ class SourceState:
         self.pip_size      = pip_size
         self.symbol        = symbol
         self.base_lot      = base_lot
-        self.dist_pips     = dist_pips
         self.start_balance = start_balance
         self._log          = log_fn or (lambda msg, level="INFO": log.info(msg))
         self._stop_fn      = stop_fn
         self._risk_free_enabled = risk_free_enabled
+
+        # Floor the BUY/SELL leg distance at MIN_LEG_SPACING_PIPS
+        # regardless of what was configured. The whole zero-spread
+        # design relies on BUY's SL landing exactly at SELL's entry
+        # (and vice versa) — if dist_pips is set too small, slippage
+        # on a single fill can squeeze that gap enough to break the
+        # mirror-SL math or trip the broker's own min-stop-distance
+        # rejection. This is a floor, not an override: configuring a
+        # larger distance is untouched.
+        min_spacing = getattr(cfg, "MIN_LEG_SPACING_PIPS", 2.0)
+        if dist_pips < min_spacing:
+            self._log(
+                f"⚠️  [{name[:20]}] dist_pips={dist_pips} below "
+                f"MIN_LEG_SPACING_PIPS={min_spacing} — raising to the "
+                f"floor to keep slippage from squeezing the BUY/SELL "
+                f"leg spacing", "WARN"
+            )
+            dist_pips = min_spacing
+        self.dist_pips     = dist_pips
 
         self.state           = self.IDLE
         self.round           = 0
@@ -97,6 +115,21 @@ class SourceState:
         self.risk_free_applied = {"buy": False, "sell": False}
         self.needs_full_reset  = False   # watcher checks/clears this
 
+        # ── Partial exit ──────────────────────────────────────────
+        # Once a side's lot reaches PARTIAL_EXIT_LOT_THRESHOLD, close
+        # PARTIAL_EXIT_FRACTION of that position at market — at most
+        # once per position. Tracks the TICKET it was last applied to
+        # (not just a bool), so a brand new position for that side
+        # naturally re-arms without needing to reset this anywhere
+        # else in the activation/confirmation code paths.
+        self._partial_exit_done = {"buy": None, "sell": None}
+        # Round-sizing baseline, separate from self.buy_lot/sell_lot
+        # (the live tracked volume). _next_lot() always doubles from
+        # THIS, never from the live lot — so a partial exit shrinking
+        # the live position doesn't also shrink what the next round
+        # computes from. Initialized to base_lot for round 1.
+        self._round_lot = {"buy": base_lot, "sell": base_lot}
+
         # ── Cumulative loss tracking (for TP sizing) ──────────────
         # Tracks total dollar loss across all closed losing positions
         # in this martingale cycle. Reset to 0 on a full reset (win
@@ -106,6 +139,7 @@ class SourceState:
         # already taken, plus the current SL risk, times the target RR.
         self.cumulative_loss = 0.0
         self._pip_value_per_base_lot = 0.0  # calibrated from real SL closes
+        self._commission_per_lot = 0.0  # calibrated from real closed deals
 
         # Original chart-object name before any auto-relocate rename —
         # used by watcher.py to remove the original chart-object-backed
@@ -173,17 +207,29 @@ class SourceState:
     @property
     def _buy_entry(self):
         """BUY_STOP entry price, spread-compensated so the effective
-        MT5 fill lands exactly at price + dist regardless of spread."""
+        MT5 fill lands exactly at price + dist regardless of spread —
+        but capped so compensation never eats below
+        MIN_ENTRY_SPACING_PIPS of real spacing from the source price.
+        Without this floor, a spread close to (or wider than) dist_pips
+        collapses the entry to nearly the touch price itself, causing
+        it to fill as a MARKET order instantly instead of waiting as
+        a genuine pending stop."""
         raw   = _round_price(self.price + self._dist, self.symbol)
         spread = self._current_spread()
+        min_buffer = getattr(cfg, "MIN_ENTRY_SPACING_PIPS", 1.0) * self.pip_size
+        spread = min(spread, max(self._dist - min_buffer, 0.0))
         return _round_price(raw - spread, self.symbol)
 
     @property
     def _sell_entry(self):
         """SELL_STOP entry price, spread-compensated so the effective
-        MT5 fill lands exactly at price − dist regardless of spread."""
+        MT5 fill lands exactly at price − dist regardless of spread —
+        same MIN_ENTRY_SPACING_PIPS floor as _buy_entry, see its
+        docstring for why this exists."""
         raw   = _round_price(self.price - self._dist, self.symbol)
         spread = self._current_spread()
+        min_buffer = getattr(cfg, "MIN_ENTRY_SPACING_PIPS", 1.0) * self.pip_size
+        spread = min(spread, max(self._dist - min_buffer, 0.0))
         return _round_price(raw + spread, self.symbol)
 
     @property
@@ -262,6 +308,34 @@ class SourceState:
             return self._pip_value_per_base_lot * lot
         return 0.0
 
+    def _calibrate_commission(self, position_ticket: int, closed_lot: float):
+        """
+        Auto-detect real commission-per-lot from MT5's own deal history
+        instead of relying on a manually-entered config constant. Sums
+        the `commission` field across ALL deals for this position
+        (entry IN + exit OUT — many brokers charge on both legs), then
+        normalizes to $/lot. Stored in self._commission_per_lot, which
+        _round_trip_cost_dollars prefers over the static
+        COMMISSION_PER_LOT config default once at least one real close
+        has been observed. Runs on every close (win, loss, risk-free)
+        since commission is charged regardless of outcome.
+        """
+        try:
+            deals = mt5.history_deals_get(position=position_ticket)
+            if not deals or closed_lot <= 0:
+                return
+            total_commission = sum(abs(float(d.commission)) for d in deals)
+            if total_commission > 0:
+                self._commission_per_lot = total_commission / closed_lot
+                self._log(
+                    f"📐  [{self.name[:20]}] commission calibrated from real "
+                    f"close: ${self._commission_per_lot:.4f}/lot "
+                    f"(total=${total_commission:.2f} lot={closed_lot:.2f})",
+                    "INFO"
+                )
+        except Exception as e:
+            log.warning("Commission calibration error: %s", e)
+
     def _calibrate_pip_value(self, closed_dollar_loss: float, closed_lot: float):
         """
         Back-calculate dollar-per-pip-per-base-lot from a real SL close.
@@ -307,11 +381,23 @@ class SourceState:
         Hard ceiling: none — we let the RR math determine the distance,
         since capping it is exactly what caused the TP to never move.
         """
-        current_lot = max(self.buy_lot, self.sell_lot, self.base_lot)
+        # Use the round-INTENDED lot (_round_lot), not the live
+        # self.buy_lot/sell_lot — those shrink after a partial exit,
+        # and since the SL-risk term below is lot-independent while
+        # the cumulative_loss/dpp term isn't, a smaller dpp from a
+        # trimmed live lot would nearly DOUBLE the pips needed to
+        # recover the same cumulative_loss. The TP target should
+        # reflect what this round was sized to achieve, not be
+        # inflated by a later risk-reduction action.
+        current_lot = max(self._round_lot["buy"], self._round_lot["sell"], self.base_lot)
         dpp = self._dollar_per_pip(current_lot)
 
-        # Minimum floor = dist_pips × 3, always achievable on round 1
-        floor_pips = self.dist_pips * 3
+        rr_primary  = getattr(cfg, "TP_RR_PRIMARY", 3)
+        rr_fallback = getattr(cfg, "TP_RR_FALLBACK", 2)
+        pips_ceiling = getattr(cfg, "TP_PIPS_CEILING", 200.0)
+
+        # Minimum floor = dist_pips × rr_primary, always achievable on round 1
+        floor_pips = self.dist_pips * rr_primary
 
         if dpp <= 0:
             self._log(
@@ -327,16 +413,17 @@ class SourceState:
 
         total_at_risk = self.cumulative_loss + current_sl_risk
 
-        # Try 1:3 first; if it puts TP unreasonably far (>200p) fall
-        # back to 1:2. This preserves the martingale's ability to
-        # actually recover even on deep runs.
-        for rr in (3, 2):
+        # Try rr_primary first; if it puts TP unreasonably far fall
+        # back to rr_fallback. This preserves the martingale's ability
+        # to actually recover even on deep runs.
+        for rr in (rr_primary, rr_fallback):
             tp_pips = (total_at_risk * rr) / dpp
-            if tp_pips <= 200.0:
+            if tp_pips <= pips_ceiling:
                 return max(tp_pips, floor_pips)
 
-        # Even 1:2 is > 200 pips — use 200p ceiling but never below floor
-        return max(200.0, floor_pips)
+        # Even rr_fallback is beyond the ceiling — use the ceiling but
+        # never below floor.
+        return max(pips_ceiling, floor_pips)
 
     @property
     def _buy_tp_price(self):
@@ -584,6 +671,7 @@ class SourceState:
             return
 
         self._check_balance_tp()
+        self._check_hard_stop_loss()
 
         if self.state == self.PENDING:
             self._check_activation()
@@ -610,6 +698,37 @@ class SourceState:
                 self._close_all_and_stop()
         except Exception as e:
             log.warning("Balance TP check error: %s", e)
+
+    def _check_hard_stop_loss(self):
+        """
+        Kill switch — independent of per-position SL, risk-free, and
+        margin protection. If account balance drops to
+        HARD_STOP_LOSS_RATIO (config.py) of session-start balance,
+        close everything and stop immediately, no matter what round
+        or state this source is in. This exists as a backstop for the
+        case where the recovery cycle itself is failing (margin
+        squeeze, slippage, a code-path bug) — not a replacement for
+        any individual order's own SL.
+        """
+        if self.start_balance <= 0:
+            return
+        try:
+            import config as cfg
+            ratio = getattr(cfg, 'HARD_STOP_LOSS_RATIO', 0.80)
+            info  = mt5.account_info()
+            if not info:
+                return
+            floor = self.start_balance * ratio
+            if info.balance <= floor:
+                self._log(
+                    f"🛑  [{self.name[:20]}] HARD STOP-LOSS! "
+                    f"balance ${info.balance:.2f} ≤ floor ${floor:.2f} "
+                    f"({ratio*100:.0f}% of start ${self.start_balance:.2f}) — "
+                    f"closing everything & stopping bot", "WARN"
+                )
+                self._close_all_and_stop()
+        except Exception as e:
+            log.warning("Hard stop-loss check error: %s", e)
 
     def _close_all_and_stop(self):
         filling = _filling_mode(self.symbol)
@@ -706,25 +825,27 @@ class SourceState:
             self.sell_ticket = None
 
         if buy_filled and not sell_filled:
-            new_sell_lot  = round(self.buy_lot * 2, 2)
-            self.sell_lot = max(new_sell_lot, 0.01)
-            if self.sell_ticket:
-                self._modify_order_lot(self.sell_ticket, self.sell_lot,
-                                       exact_sl=self._sell_sl_price)
+            computed = self._next_lot(self._round_lot["buy"])
+            self.sell_lot = self._safe_modify_opposite_lot(
+                self.sell_ticket, computed, is_buy=False,
+                sl_price=self._sell_sl_price, current_lot=self.sell_lot)
+            self._round_lot["sell"] = self.sell_lot
             self._log(
                 f"🟢  [{self.name[:20]}] R{self.round} BUY activated | "
                 f"pos#{self.buy_pos_ticket} sl={self._buy_sl_price:.5f} | "
                 f"SELL#{self.sell_ticket} lot → {self.sell_lot:.2f}", "NEW"
             )
         elif sell_filled and not buy_filled:
-            new_buy_lot  = round(self.sell_lot * 2, 2)
-            self.buy_lot = max(new_buy_lot, 0.01)
-            if self.buy_ticket:
-                if self.buy_ticket in pending:
-                    self._modify_order_lot(self.buy_ticket, self.buy_lot,
-                                           exact_sl=self._buy_sl_price)
-                else:
-                    self.buy_lot = buy_pos[0].volume if buy_pos else self.buy_lot
+            if self.buy_ticket and self.buy_ticket not in pending:
+                # Already filled as a position — can't change its
+                # volume, just sync our tracked lot to what's live.
+                self.buy_lot = buy_pos[0].volume if buy_pos else self.buy_lot
+            else:
+                computed = self._next_lot(self._round_lot["sell"])
+                self.buy_lot = self._safe_modify_opposite_lot(
+                    self.buy_ticket, computed, is_buy=True,
+                    sl_price=self._buy_sl_price, current_lot=self.buy_lot)
+                self._round_lot["buy"] = self.buy_lot
             self._log(
                 f"🔴  [{self.name[:20]}] R{self.round} SELL activated | "
                 f"pos#{self.sell_pos_ticket} sl={self._sell_sl_price:.5f} | "
@@ -743,7 +864,7 @@ class SourceState:
 
     def _check_legs(self):
         now      = _time.time()
-        in_grace = (now - self._activated_at) < ACTIVATION_GRACE_SEC
+        in_grace = (now - self._activated_at) < getattr(cfg, "ACTIVATION_GRACE_SEC", 5)
 
         positions    = mt5.positions_get(symbol=self.symbol) or []
         bot_pos      = [p for p in positions if p.magic == MAGIC_NUMBER]
@@ -790,13 +911,15 @@ class SourceState:
                 self.buy_sl         = pos.sl
                 self.buy_r_frozen   = abs(pos.price_open - pos.sl)
                 self.buy_lot        = pos.volume
+                self._round_lot["buy"] = pos.volume
                 self._buy_confirmed = True
                 self.buy_ticket     = None
-                new_sell_lot  = round(self.buy_lot * 2, 2)
-                self.sell_lot = max(new_sell_lot, 0.01)
-                if self.sell_ticket and self.sell_ticket in pending:
-                    self._modify_order_lot(self.sell_ticket, self.sell_lot,
-                                           exact_sl=self._sell_sl_price)
+                computed = self._next_lot(self._round_lot["buy"])
+                opp_ticket = self.sell_ticket if (self.sell_ticket and self.sell_ticket in pending) else None
+                self.sell_lot = self._safe_modify_opposite_lot(
+                    opp_ticket, computed, is_buy=False,
+                    sl_price=self._sell_sl_price, current_lot=self.sell_lot)
+                self._round_lot["sell"] = self.sell_lot
                 self.round += 1
                 self._log(
                     f"🟢  [{self.name[:20]}] R{self.round} BUY activated (2nd) | "
@@ -813,13 +936,15 @@ class SourceState:
                 self.sell_sl         = pos.sl
                 self.sell_r_frozen   = abs(pos.price_open - pos.sl)
                 self.sell_lot        = pos.volume
+                self._round_lot["sell"] = pos.volume
                 self._sell_confirmed = True
                 self.sell_ticket     = None
-                new_buy_lot  = round(self.sell_lot * 2, 2)
-                self.buy_lot = max(new_buy_lot, 0.01)
-                if self.buy_ticket and self.buy_ticket in pending:
-                    self._modify_order_lot(self.buy_ticket, self.buy_lot,
-                                           exact_sl=self._buy_sl_price)
+                computed = self._next_lot(self._round_lot["sell"])
+                opp_ticket = self.buy_ticket if (self.buy_ticket and self.buy_ticket in pending) else None
+                self.buy_lot = self._safe_modify_opposite_lot(
+                    opp_ticket, computed, is_buy=True,
+                    sl_price=self._buy_sl_price, current_lot=self.buy_lot)
+                self._round_lot["buy"] = self.buy_lot
                 self.round += 1
                 self._log(
                     f"🔴  [{self.name[:20]}] R{self.round} SELL activated (2nd) | "
@@ -839,6 +964,7 @@ class SourceState:
 
         # ── Risk-free: move SL to lock +1R once floating profit ≥2R ─
         self._check_risk_free(buy_pos, sell_pos)
+        self._check_partial_exit(buy_pos, sell_pos)
 
         # ── Detect closed positions → place new stop ──────────────
         # Pass the EXACT price the closed position's SL executed at,
@@ -853,6 +979,7 @@ class SourceState:
                 and self._buy_confirmed):
             closed_ticket = self.buy_pos_ticket
             close_price, close_reason = self._get_close_info(closed_ticket)
+            self._calibrate_commission(closed_ticket, self.buy_lot)
             was_risk_free = self.risk_free_applied.get("buy", False)
             self._log(
                 f"📉  [{self.name[:20]}] BUY pos#{closed_ticket} closed"
@@ -901,6 +1028,7 @@ class SourceState:
                 and self._sell_confirmed):
             closed_ticket = self.sell_pos_ticket
             close_price, close_reason = self._get_close_info(closed_ticket)
+            self._calibrate_commission(closed_ticket, self.sell_lot)
             was_risk_free = self.risk_free_applied.get("sell", False)
             self._log(
                 f"📉  [{self.name[:20]}] SELL pos#{closed_ticket} closed"
@@ -1052,19 +1180,20 @@ class SourceState:
         """
         if not self._risk_free_enabled:
             return
+        trigger_r = getattr(cfg, "RISK_FREE_TRIGGER_R", 2.0)
         if buy_pos and not self.risk_free_applied.get("buy", False):
             pos = sorted(buy_pos, key=lambda p: p.time, reverse=True)[0]
             r = self.buy_r_frozen
             if r > 0:
                 profit_dist = pos.price_current - pos.price_open
-                if profit_dist >= 2 * r:
+                if profit_dist >= trigger_r * r:
                     lock_dist = self._risk_free_lock_distance(r, pos.volume)
                     new_sl = _round_price(pos.price_open + lock_dist, self.symbol)
                     if self._move_position_sl(pos.ticket, new_sl):
                         self.risk_free_applied["buy"] = True
                         self._log(
                             f"🛡️  [{self.name[:20]}] BUY risk-free | "
-                            f"profit={profit_dist:.5f} ≥ 2R={2*r:.5f} | "
+                            f"profit={profit_dist:.5f} ≥ {trigger_r:g}R={trigger_r*r:.5f} | "
                             f"SL moved to {new_sl:.5f} "
                             f"(covers cumulative_loss=${self.cumulative_loss:.2f} "
                             f"+ this round's risk)", "NEW"
@@ -1075,27 +1204,140 @@ class SourceState:
             r = self.sell_r_frozen
             if r > 0:
                 profit_dist = pos.price_open - pos.price_current
-                if profit_dist >= 2 * r:
+                if profit_dist >= trigger_r * r:
                     lock_dist = self._risk_free_lock_distance(r, pos.volume)
                     new_sl = _round_price(pos.price_open - lock_dist, self.symbol)
                     if self._move_position_sl(pos.ticket, new_sl):
                         self.risk_free_applied["sell"] = True
                         self._log(
                             f"🛡️  [{self.name[:20]}] SELL risk-free | "
-                            f"profit={profit_dist:.5f} ≥ 2R={2*r:.5f} | "
+                            f"profit={profit_dist:.5f} ≥ {trigger_r:g}R={trigger_r*r:.5f} | "
                             f"SL moved to {new_sl:.5f} "
                             f"(covers cumulative_loss=${self.cumulative_loss:.2f} "
                             f"+ this round's risk)", "NEW"
                         )
+
+    def _check_partial_exit(self, buy_pos: list, sell_pos: list):
+        """
+        Once an open position's lot reaches PARTIAL_EXIT_LOT_THRESHOLD
+        (a deep recovery round), close PARTIAL_EXIT_FRACTION of it at
+        market right away — reduces real exposure immediately instead
+        of waiting for that round's own SL/TP on the full size. Runs
+        at most once per position (tracked by ticket in
+        _partial_exit_done, see __init__). Logs free margin right
+        after, since freeing margin here can be exactly what unblocks
+        the next round if it was previously margin-limited.
+        """
+        threshold = getattr(cfg, "PARTIAL_EXIT_LOT_THRESHOLD", 0.32)
+        fraction  = getattr(cfg, "PARTIAL_EXIT_FRACTION", 0.30)
+        lot_step  = getattr(cfg, "LOT_STEP", 0.01)
+
+        if buy_pos and self.buy_lot >= threshold:
+            pos = sorted(buy_pos, key=lambda p: p.time, reverse=True)[0]
+            if self._partial_exit_done.get("buy") != pos.ticket:
+                partial_vol = round(round(pos.volume * fraction / lot_step) * lot_step, 2)
+                partial_vol = min(partial_vol, round(pos.volume - lot_step, 2))
+                if partial_vol >= lot_step:
+                    if self._partial_close_position(pos.ticket, partial_vol, is_buy=True):
+                        self.buy_lot = round(self.buy_lot - partial_vol, 2)
+                        self._partial_exit_done["buy"] = pos.ticket
+                        acct = mt5.account_info()
+                        fm = f"${acct.margin_free:.2f}" if acct else "?"
+                        self._log(
+                            f"✂️  [{self.name[:20]}] BUY partial exit | closed "
+                            f"{partial_vol:.2f} of {pos.volume:.2f} lot | "
+                            f"remaining tracked lot={self.buy_lot:.2f} | "
+                            f"free margin now {fm}", "NEW"
+                        )
+                self._partial_exit_done["buy"] = pos.ticket
+
+        if sell_pos and self.sell_lot >= threshold:
+            pos = sorted(sell_pos, key=lambda p: p.time, reverse=True)[0]
+            if self._partial_exit_done.get("sell") != pos.ticket:
+                partial_vol = round(round(pos.volume * fraction / lot_step) * lot_step, 2)
+                partial_vol = min(partial_vol, round(pos.volume - lot_step, 2))
+                if partial_vol >= lot_step:
+                    if self._partial_close_position(pos.ticket, partial_vol, is_buy=False):
+                        self.sell_lot = round(self.sell_lot - partial_vol, 2)
+                        self._partial_exit_done["sell"] = pos.ticket
+                        acct = mt5.account_info()
+                        fm = f"${acct.margin_free:.2f}" if acct else "?"
+                        self._log(
+                            f"✂️  [{self.name[:20]}] SELL partial exit | closed "
+                            f"{partial_vol:.2f} of {pos.volume:.2f} lot | "
+                            f"remaining tracked lot={self.sell_lot:.2f} | "
+                            f"free margin now {fm}", "NEW"
+                        )
+                self._partial_exit_done["sell"] = pos.ticket
+
+    def _partial_close_position(self, ticket: int, volume: float, is_buy: bool) -> bool:
+        """
+        Closes `volume` lots of an open position at market, leaving
+        the remainder open with reduced size — same request shape
+        _close_all_and_stop already uses for a full close, just with
+        volume < the position's full size.
+        """
+        try:
+            filling = _filling_mode(self.symbol)
+            tick = mt5.symbol_info_tick(self.symbol)
+            if not tick:
+                return False
+            price = tick.bid if is_buy else tick.ask
+            res = mt5.order_send({
+                "action":       mt5.TRADE_ACTION_DEAL,
+                "symbol":       self.symbol,
+                "volume":       volume,
+                "type":         mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
+                "position":     ticket,
+                "price":        price,
+                "deviation":    30,
+                "magic":        MAGIC_NUMBER,
+                "comment":      "TB2_PartialExit",
+                "type_filling": filling,
+            })
+            return bool(res and res.retcode == mt5.TRADE_RETCODE_DONE)
+        except Exception as e:
+            log.warning("Partial close error: %s", e)
+            return False
+
+    def _round_trip_cost_dollars(self, lot: float) -> float:
+        """
+        Real cost of this round-trip in dollars: current live spread
+        (converted via the real $/pip at this lot) + broker commission
+        (COMMISSION_PER_LOT × lot, config.py). Used to pad the
+        risk-free lock so the profit you actually walk away with —
+        after costs — still covers what the lock was sized to cover,
+        not just the on-paper price-distance amount.
+        """
+        dpp = self._dollar_per_pip(lot)
+        if dpp <= 0:
+            return 0.0
+        spread_price  = self._current_spread()
+        spread_pips   = spread_price / self.pip_size
+        spread_cost   = spread_pips * dpp
+        # Prefer real calibrated commission (from this account's own
+        # closed deals) over the static config default — it's only
+        # a guess until the first real close calibrates it.
+        commission_per_lot = (self._commission_per_lot
+                               if getattr(self, "_commission_per_lot", 0.0) > 0
+                               else getattr(cfg, "COMMISSION_PER_LOT", 0.0))
+        commission_cost = commission_per_lot * lot
+        return spread_cost + commission_cost
 
     def _risk_free_lock_distance(self, r_price: float, lot: float) -> float:
         """
         Price distance (always positive) the risk-free SL should sit
         beyond entry, sized so the locked-in dollar profit covers
         cumulative_loss (all real losses taken so far this cycle)
-        PLUS this round's own risk in dollars — not just a flat +1R.
+        PLUS this round's own risk in dollars, PLUS the real round-trip
+        cost (spread + commission) of closing at that SL — not just a
+        flat +1R or a cost-blind dollar target. Without the cost term,
+        a "+1R locked" SL can realize noticeably less than 1R once
+        spread/commission are taken out, occasionally close to
+        breakeven on tight setups.
 
         total_at_risk_$ = cumulative_loss + (r_price_in_pips × $/pip)
+                          + round_trip_cost
         lock_distance    = total_at_risk_$ / $/pip   (back to price units)
 
         Falls back to the plain +1R distance if dollar-per-pip can't
@@ -1107,7 +1349,10 @@ class SourceState:
 
         r_pips = r_price / self.pip_size
         this_round_risk_dollars = r_pips * dpp
-        total_at_risk_dollars   = self.cumulative_loss + this_round_risk_dollars
+        cost_dollars            = self._round_trip_cost_dollars(lot)
+        total_at_risk_dollars   = (self.cumulative_loss
+                                    + this_round_risk_dollars
+                                    + cost_dollars)
 
         lock_pips = total_at_risk_dollars / dpp
         return lock_pips * self.pip_size
@@ -1209,9 +1454,13 @@ class SourceState:
 
     def _max_affordable_lot(self, lot_step: float = 0.01) -> float:
         """
-        Largest lot size (rounded down to lot_step) that passes
-        _can_afford's margin check right now. Returns 0.0 if even the
-        minimum lot isn't affordable.
+        Largest lot size (rounded down to lot_step) that's both
+        margin-affordable AND loss-safe right now (see
+        _max_loss_safe_lot — margin and potential dollar loss are
+        different constraints; a lot can be cheap on margin via
+        leverage while still risking a loss that blows through the
+        hard stop-loss floor). Returns 0.0 if even the minimum lot
+        fails either check.
         """
         try:
             acct = mt5.account_info()
@@ -1227,11 +1476,13 @@ class SourceState:
                 return 0.0
             free_margin   = acct.margin_free
             equity        = acct.equity
-            safety_margin = equity * 0.05
+            safety_margin = equity * getattr(cfg, "MARGIN_SAFETY_RATIO", 0.05)
             usable_margin = free_margin - safety_margin
             if usable_margin <= 0:
                 return 0.0
-            max_lot = usable_margin / probe_margin
+            margin_max_lot = usable_margin / probe_margin
+            loss_safe_lot  = self._max_loss_safe_lot()
+            max_lot = min(margin_max_lot, loss_safe_lot)
             # Round down to the nearest lot_step, floor at 0.
             steps = int(max_lot / lot_step)
             return max(steps * lot_step, 0.0)
@@ -1304,6 +1555,106 @@ class SourceState:
             log.warning("Bounce confluence check error: %s", e)
             return True  # fail open on any error — don't block on a bug here
 
+    def _next_lot(self, prior_lot: float) -> float:
+        """
+        Compute the next recovery round's lot from the prior lot, using
+        the configurable LOT_MULTIPLIER (config.py) instead of a
+        hardcoded doubling. Default 2.0 preserves exact prior behavior.
+        Lowering the multiplier smooths the growth curve so the account
+        survives more rounds before margin protection kicks in — the
+        TP formula (_tp_pips) already derives its target from real
+        cumulative_loss, so it adapts automatically to whatever this
+        returns and recovery math stays sound at any multiplier.
+
+        IMPORTANT: at small lots combined with a gentle multiplier
+        (e.g. 0.01 × 1.5 = 0.015), naive rounding to the lot step can
+        round straight back down to the SAME value every round —
+        silently stalling the martingale forever (0.01 -> 0.01 -> 0.01
+        ...). We force at least one lot-step of forward progress every
+        round regardless of what the multiplier/rounding would do.
+        """
+        import config as cfg
+        multiplier = getattr(cfg, "LOT_MULTIPLIER", 2.0)
+        lot_step   = getattr(cfg, "LOT_STEP", 0.01)
+
+        raw_next = prior_lot * multiplier
+        # Never allow a round to fail to advance — floor it at +1 step.
+        floored  = max(raw_next, prior_lot + lot_step)
+        # Snap to the lot-step grid (avoids broker rejection on
+        # off-grid volumes like 0.013).
+        on_grid  = round(floored / lot_step) * lot_step
+        return max(round(on_grid, 2), lot_step)
+
+    def _safe_modify_opposite_lot(self, ticket, computed_lot: float,
+                                   is_buy: bool, sl_price: float,
+                                   current_lot: float) -> float:
+        """
+        Bump the OPPOSITE side's pending order lot (e.g. doubling the
+        pending SELL when BUY just activated) — margin-gated, same as
+        new-stop placement already is. Without this gate, a pending
+        order can silently grow several rounds in a row while sitting
+        unfilled (every time the OTHER side loses again), accumulating
+        a large lot with zero margin check, then realize one oversized
+        loss the instant it finally fills and hits its own SL — large
+        enough to blow straight through the hard stop-loss floor
+        before the bot ever gets a chance to react, since that check
+        only fires on REALIZED balance changes. Returns the lot
+        actually applied (may be smaller than computed_lot, or
+        unchanged from current_lot if even the minimum isn't
+        affordable right now).
+        """
+        lot = computed_lot
+        if not self._can_afford(lot, is_buy):
+            reduced = self._max_affordable_lot()
+            if reduced >= 0.01:
+                self._log(
+                    f"🛡️  [{self.name[:20]}] opposite-side lot bump "
+                    f"{lot:.2f} → {reduced:.2f} (margin-limited)", "WARN"
+                )
+                lot = reduced
+            else:
+                self._log(
+                    f"🛡️  [{self.name[:20]}] opposite-side lot bump to "
+                    f"{lot:.2f} BLOCKED — not affordable, keeping "
+                    f"current lot {current_lot:.2f}", "WARN"
+                )
+                return current_lot
+        if ticket:
+            self._modify_order_lot(ticket, lot, exact_sl=sl_price)
+        return lot
+
+    def _max_loss_safe_lot(self) -> float:
+        """
+        Largest lot whose own SL-hit loss would NOT push account
+        balance below the hard stop-loss floor, given current
+        balance. This is a DIFFERENT constraint than margin
+        affordability (_max_affordable_lot) — a lot can be cheap on
+        margin (leverage makes margin small) while its potential
+        DOLLAR LOSS if stopped out is still large enough to blow
+        straight through the hard-stop floor in one shot. Both
+        constraints must hold; _can_afford() checks both.
+        Returns float('inf') if it can't be computed (fail open,
+        consistent with the rest of this file's fallback behavior).
+        """
+        try:
+            ratio = getattr(cfg, "HARD_STOP_LOSS_RATIO", 0.80)
+            floor = self.start_balance * ratio
+            acct = mt5.account_info()
+            if not acct:
+                return float("inf")
+            budget = acct.balance - floor
+            if budget <= 0:
+                return 0.0
+            dpp_per_lot = self._dollar_per_pip(1.0)
+            if dpp_per_lot <= 0:
+                return float("inf")
+            sl_pips = self.dist_pips * 2  # fixed mirror-geometry SL distance
+            if sl_pips <= 0:
+                return float("inf")
+            return budget / (sl_pips * dpp_per_lot)
+        except Exception:
+            return float("inf")
+
     def _can_afford(self, lot: float, is_buy: bool) -> bool:
         try:
             action = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
@@ -1315,14 +1666,11 @@ class SourceState:
                 return True
             free_margin   = acct.margin_free
             equity        = acct.equity
-            # 5% cushion — enough to avoid landing right at a literal
+            # Cushion — enough to avoid landing right at a literal
             # margin call after this fill, without blocking trades the
-            # account can genuinely afford. The previous 20% buffer
-            # was blocking real, affordable rounds (e.g. needing
-            # $2122 against $2445 free — actually affordable — got
-            # blocked because the 20%-of-equity cushion demanded $706
-            # left over, not because the trade itself was unaffordable).
-            safety_margin = equity * 0.05
+            # account can genuinely afford. Tunable via
+            # MARGIN_SAFETY_RATIO in config.py.
+            safety_margin = equity * getattr(cfg, "MARGIN_SAFETY_RATIO", 0.05)
             if free_margin - margin < safety_margin:
                 self._log(
                     f"🛡️  [{self.name[:20]}] R{self.round} MARGIN PROTECTION | "
@@ -1331,6 +1679,25 @@ class SourceState:
                     f"cannot place safely — resetting to IDLE", "WARN"
                 )
                 return False
+
+            # Separate check: margin being affordable (cheap, thanks
+            # to leverage) does NOT mean the potential DOLLAR LOSS if
+            # this lot's SL is hit is small. Without this, a large
+            # lot can sail through the margin check above and still
+            # realize a single loss big enough to blow straight
+            # through the hard stop-loss floor before that check ever
+            # gets a chance to react (it only fires on realized
+            # balance changes, after the fact).
+            loss_safe_lot = self._max_loss_safe_lot()
+            if lot > loss_safe_lot:
+                self._log(
+                    f"🛡️  [{self.name[:20]}] R{self.round} LOSS-BUDGET PROTECTION | "
+                    f"lot={lot:.2f} could lose more than the hard "
+                    f"stop-loss floor allows (safe ceiling={loss_safe_lot:.2f}) — "
+                    f"cannot place safely", "WARN"
+                )
+                return False
+
             return True
         except Exception as e:
             log.warning("Margin check error: %s", e)
@@ -1338,8 +1705,8 @@ class SourceState:
 
     def _place_new_buy_stop(self, anchor_price: float = None):
         self.round  += 1
-        new_buy_lot  = round(self.sell_lot * 2, 2)
-        self.buy_lot = max(new_buy_lot, 0.01)
+        new_buy_lot  = self._next_lot(self._round_lot["sell"])
+        self.buy_lot = new_buy_lot
 
         if not self._can_afford(self.buy_lot, is_buy=True):
             # Full doubled lot isn't affordable — try the largest lot
@@ -1379,18 +1746,27 @@ class SourceState:
         if anchor_price is not None:
             self._reanchor_buy(anchor_price)
 
+        # This round's lot is now finalized (after any margin
+        # reduction above) — lock it in as the round-sizing baseline.
+        # Kept separate from self.buy_lot so a later partial exit can
+        # shrink the LIVE position's tracked volume (for accurate
+        # loss/TP math) without also shrinking what the NEXT round
+        # doubles from.
+        self._round_lot["buy"] = self.buy_lot
+
         # ── Structural gate for deep rounds ─────────────────────────
-        # Once lot has grown large (≥0.64) OR free margin is getting
-        # tight, don't just blindly double again — require real OB+FVG
-        # confluence supporting a bounce. If neither condition is met,
-        # this is a no-op (cheap checks only, no detector calls).
-        deep_round = self.buy_lot >= 0.64
+        # Once lot has grown large OR free margin is getting tight,
+        # don't just blindly double again — require real OB+FVG
+        # confluence supporting a bounce. Thresholds tunable via
+        # DEEP_ROUND_LOT_THRESHOLD / TIGHT_MARGIN_RATIO in config.py.
+        deep_round = self.buy_lot >= getattr(cfg, "DEEP_ROUND_LOT_THRESHOLD", 0.64)
         tight_margin = False
         if not deep_round:
             try:
                 acct = mt5.account_info()
                 if acct and acct.equity > 0:
-                    tight_margin = (acct.margin_free / acct.equity) < 0.30
+                    tight_margin = (acct.margin_free / acct.equity) < getattr(
+                        cfg, "TIGHT_MARGIN_RATIO", 0.30)
             except Exception:
                 pass
 
@@ -1415,13 +1791,14 @@ class SourceState:
 
         if ok:
             self.buy_ticket = ok[0]["ticket"]
-            new_sell_lot  = round(self.buy_lot * 2, 2)
-            self.sell_lot = max(new_sell_lot, 0.01)
+            computed = self._next_lot(self._round_lot["buy"])
             pending = {o.ticket for o in (mt5.orders_get(symbol=self.symbol) or [])
                        if o.magic == MAGIC_NUMBER}
-            if self.sell_ticket and self.sell_ticket in pending:
-                self._modify_order_lot(self.sell_ticket, self.sell_lot,
-                                       exact_sl=self._sell_sl_price)
+            opp_ticket = self.sell_ticket if (self.sell_ticket and self.sell_ticket in pending) else None
+            self.sell_lot = self._safe_modify_opposite_lot(
+                opp_ticket, computed, is_buy=False,
+                sl_price=self._sell_sl_price, current_lot=self.sell_lot)
+            self._round_lot["sell"] = self.sell_lot
             self._log(
                 f"🔁  [{self.name[:20]}] R{self.round} new BUY-STOP | "
                 f"entry={self._buy_entry:.5f} sl={self._buy_sl_price:.5f} "
@@ -1431,8 +1808,8 @@ class SourceState:
 
     def _place_new_sell_stop(self, anchor_price: float = None):
         self.round   += 1
-        new_sell_lot  = round(self.buy_lot * 2, 2)
-        self.sell_lot = max(new_sell_lot, 0.01)
+        new_sell_lot  = self._next_lot(self._round_lot["buy"])
+        self.sell_lot = new_sell_lot
 
         if not self._can_afford(self.sell_lot, is_buy=False):
             reduced_lot = self._max_affordable_lot()
@@ -1458,13 +1835,20 @@ class SourceState:
         if anchor_price is not None:
             self._reanchor_sell(anchor_price)
 
-        deep_round = self.sell_lot >= 0.64
+        # This round's lot is now finalized — lock it in as the
+        # round-sizing baseline (see matching comment in
+        # _place_new_buy_stop for why this is kept separate from
+        # self.sell_lot).
+        self._round_lot["sell"] = self.sell_lot
+
+        deep_round = self.sell_lot >= getattr(cfg, "DEEP_ROUND_LOT_THRESHOLD", 0.64)
         tight_margin = False
         if not deep_round:
             try:
                 acct = mt5.account_info()
                 if acct and acct.equity > 0:
-                    tight_margin = (acct.margin_free / acct.equity) < 0.30
+                    tight_margin = (acct.margin_free / acct.equity) < getattr(
+                        cfg, "TIGHT_MARGIN_RATIO", 0.30)
             except Exception:
                 pass
 
@@ -1489,13 +1873,14 @@ class SourceState:
 
         if ok:
             self.sell_ticket = ok[0]["ticket"]
-            new_buy_lot  = round(self.sell_lot * 2, 2)
-            self.buy_lot = max(new_buy_lot, 0.01)
+            computed = self._next_lot(self._round_lot["sell"])
             pending = {o.ticket for o in (mt5.orders_get(symbol=self.symbol) or [])
                        if o.magic == MAGIC_NUMBER}
-            if self.buy_ticket and self.buy_ticket in pending:
-                self._modify_order_lot(self.buy_ticket, self.buy_lot,
-                                       exact_sl=self._buy_sl_price)
+            opp_ticket = self.buy_ticket if (self.buy_ticket and self.buy_ticket in pending) else None
+            self.buy_lot = self._safe_modify_opposite_lot(
+                opp_ticket, computed, is_buy=True,
+                sl_price=self._buy_sl_price, current_lot=self.buy_lot)
+            self._round_lot["buy"] = self.buy_lot
             self._log(
                 f"🔁  [{self.name[:20]}] R{self.round} new SELL-STOP | "
                 f"entry={self._sell_entry:.5f} sl={self._sell_sl_price:.5f} "
@@ -1605,8 +1990,10 @@ class SourceState:
         self._buy_confirmed  = False
         self._sell_confirmed = False
         self.risk_free_applied = {"buy": False, "sell": False}
+        self._round_lot = {"buy": self.base_lot, "sell": self.base_lot}
         self.cumulative_loss   = 0.0
         self._pip_value_per_base_lot = 0.0
+        self._commission_per_lot     = 0.0
         self._log(f"🔄  [{self.name[:20]}] state reset to IDLE")
         try:
             from core.resume import clear_session
